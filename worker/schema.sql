@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS emails (
   from_address TEXT NOT NULL,
   from_name TEXT DEFAULT '',
   to_address TEXT NOT NULL,
+  peer_address TEXT,
   subject TEXT DEFAULT '',
   body_text TEXT DEFAULT '',
   body_html TEXT DEFAULT '',
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS cli_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS idx_emails_mailbox ON emails(mailbox, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_emails_peer ON emails(mailbox, peer_address, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_emails_code ON emails(mailbox) WHERE code IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_emails_direction ON emails(direction);
 CREATE INDEX IF NOT EXISTS idx_emails_has_attachments ON emails(mailbox, has_attachments, received_at DESC);

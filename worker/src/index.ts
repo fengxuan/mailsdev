@@ -117,18 +117,19 @@ export default {
     const statements = [
       env.DB.prepare(`
         INSERT INTO emails (
-          id, mailbox, from_address, from_name, to_address, subject,
+          id, mailbox, from_address, from_name, to_address, peer_address, subject,
           body_text, body_html, code, headers, metadata, message_id,
           has_attachments, attachment_count, attachment_names, attachment_search_text,
           raw_storage_key, direction, status, received_at, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'inbound', 'received', ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'inbound', 'received', ?, ?)
       `).bind(
         id,
         mailbox,
         fromAddress,
         fromName,
         mailbox,
+        fromAddress,
         subject,
         parsed.bodyText.slice(0, 50000),
         parsed.bodyHtml.slice(0, 100000),
@@ -500,17 +501,18 @@ async function persistLocalInboundEmails(
     const id = crypto.randomUUID()
     return env.DB.prepare(`
       INSERT INTO emails (
-        id, mailbox, from_address, from_name, to_address, subject,
+        id, mailbox, from_address, from_name, to_address, peer_address, subject,
         body_text, body_html, code, headers, metadata, message_id,
         has_attachments, attachment_count, attachment_names, attachment_search_text,
         raw_storage_key, direction, status, provider, received_at, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, '{}', NULL, 0, 0, '', '', NULL, 'inbound', 'received', 'local', ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, '{}', NULL, 0, 0, '', '', NULL, 'inbound', 'received', 'local', ?, ?)
     `).bind(
       id,
       recipient,
       input.fromAddress,
       input.fromName,
       recipient,
+      input.fromAddress,
       input.subject,
       (input.bodyText ?? '').slice(0, 50000),
       (input.bodyHtml ?? '').slice(0, 100000),
@@ -541,17 +543,18 @@ async function persistOutboundEmail(
 ): Promise<void> {
   await env.DB.prepare(`
     INSERT INTO emails (
-      id, mailbox, from_address, from_name, to_address, subject,
+      id, mailbox, from_address, from_name, to_address, peer_address, subject,
       body_text, body_html, code, headers, metadata, message_id,
       has_attachments, attachment_count, attachment_names, attachment_search_text,
       raw_storage_key, direction, status, provider, received_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}', '{}', NULL, ?, ?, '', '', NULL, 'outbound', 'sent', ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}', '{}', NULL, ?, ?, '', '', NULL, 'outbound', 'sent', ?, ?, ?)
   `).bind(
     input.id,
     input.mailbox,
     input.fromAddress,
     input.fromName,
     input.toAddress,
+    normalizeSingleRecipient(input.toAddress),
     input.subject,
     (input.bodyText ?? '').slice(0, 50000),
     (input.bodyHtml ?? '').slice(0, 100000),
@@ -589,24 +592,40 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   }
 
   const since = url.searchParams.get('since') || '1970-01-01T00:00:00Z'
+  const peer = optionalPeer(url.searchParams.get('peer'))
+  const before = optionalIsoTime(url.searchParams.get('before'))
   const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '100'), 500)
   const offset = parseInt(url.searchParams.get('offset') ?? '0')
 
-  // Count total matching emails
+  const whereParts = ['mailbox = ?', 'received_at > ?']
+  const params: Array<string | number> = [authorizedMailbox, since]
+
+  if (peer) {
+    whereParts.push('peer_address = ?')
+    params.push(peer)
+  }
+
+  if (before) {
+    whereParts.push('received_at < ?')
+    params.push(before)
+  }
+
+  const whereClause = whereParts.join(' AND ')
+
   const countRow = await env.DB.prepare(
-    'SELECT COUNT(*) as total FROM emails WHERE mailbox = ? AND received_at > ?'
-  ).bind(authorizedMailbox, since).first<{ total: number }>()
+    `SELECT COUNT(*) as total FROM emails WHERE ${whereClause}`
+  ).bind(...params).first<{ total: number }>()
   const total = countRow?.total ?? 0
 
-  // Get emails with full data
+  const rowOrder = peer ? 'DESC' : 'ASC'
+
   const rows = await env.DB.prepare(`
     SELECT * FROM emails
-    WHERE mailbox = ? AND received_at > ?
-    ORDER BY received_at ASC
+    WHERE ${whereClause}
+    ORDER BY received_at ${rowOrder}
     LIMIT ? OFFSET ?
-  `).bind(authorizedMailbox, since, limit, offset).all()
+  `).bind(...params, limit, offset).all()
 
-  // For each email, fetch attachments
   const emails = []
   for (const row of rows.results) {
     const r = row as Record<string, unknown>
@@ -701,10 +720,30 @@ function parseFromName(from: string): string {
   return match ? match[1]!.trim() : ''
 }
 
+function optionalPeer(value: string | null): string | undefined {
+  const trimmed = value?.trim()
+  if (!trimmed) return undefined
+  return normalizeMailbox(trimmed)
+}
+
+function optionalIsoTime(value: string | null): string | undefined {
+  const trimmed = value?.trim()
+  if (!trimmed) return undefined
+  return trimmed
+}
+
 function normalizeMailbox(value: string): string {
   const match = value.match(/<([^>]+)>/)
   const mailbox = (match?.[1] ?? value).trim().toLowerCase()
   return mailbox
+}
+
+function normalizeSingleRecipient(value: string): string | null {
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.includes(',')) {
+    return null
+  }
+  return normalizeMailbox(trimmed)
 }
 
 function isValidEmail(value: string): boolean {
