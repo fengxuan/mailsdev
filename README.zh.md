@@ -116,6 +116,16 @@ mails config set mailbox agent@yourdomain.com
 mails send --to user@example.com --subject "Hello" --body "Hi"  # 通过 Worker 发送
 mails inbox                              # 查询 Worker API
 mails sync                               # 下载邮件到本地 SQLite
+
+# 如果你的认证流会通过 mails-chat-api 签发 CLI token，
+# 可以用仓库里的 helper 脚本自动配置本地 mails CLI：
+npm --prefix worker run mails:cli-login -- --email you@example.com
+# 脚本会先发送验证码，再提示你输入验证码，然后自动写入：
+#   worker_url
+#   worker_token
+#   mailbox
+#   default_from
+# 并清理 ~/.mails/config.json 里旧的 hosted api_key/token
 ```
 
 ## CLI 参考

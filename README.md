@@ -116,6 +116,16 @@ mails config set mailbox agent@yourdomain.com
 mails send --to user@example.com --subject "Hello" --body "Hi"  # Sends via Worker
 mails inbox                              # Queries Worker API
 mails sync                               # Download emails to local SQLite
+
+# If your auth flow issues CLI tokens via mails-chat-api, you can auto-configure
+# the local mails CLI with the helper script in this repo:
+npm --prefix worker run mails:cli-login -- --email you@example.com
+# The script sends a verification code, prompts for it, then writes:
+#   worker_url
+#   worker_token
+#   mailbox
+#   default_from
+# and clears any old hosted api_key/token from ~/.mails/config.json
 ```
 
 ## CLI Reference

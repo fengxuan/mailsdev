@@ -116,6 +116,16 @@ mails config set mailbox agent@yourdomain.com
 mails send --to user@example.com --subject "Hello" --body "Hi"  # Worker経由で送信
 mails inbox                              # Worker APIに問い合わせ
 mails sync                               # メールをローカルSQLiteにダウンロード
+
+# 認証フローで mails-chat-api から CLI token を発行する場合は、
+# このリポジトリ内の helper スクリプトで local mails CLI を自動設定できます:
+npm --prefix worker run mails:cli-login -- --email you@example.com
+# スクリプトは認証コードを送信し、コード入力後に次を自動設定します:
+#   worker_url
+#   worker_token
+#   mailbox
+#   default_from
+# あわせて ~/.mails/config.json に残っている hosted api_key/token も削除します
 ```
 
 ## CLIリファレンス

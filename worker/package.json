@@ -6,7 +6,8 @@
     "deploy": "wrangler deploy",
     "db:create": "wrangler d1 create mails",
     "db:schema": "wrangler d1 execute mails --file=schema.sql",
-    "db:schema:local": "wrangler d1 execute mails --local --file=schema.sql"
+    "db:schema:local": "wrangler d1 execute mails --local --file=schema.sql",
+    "mails:cli-login": "node ./scripts/mails-cli-login.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4",

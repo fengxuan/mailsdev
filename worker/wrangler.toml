@@ -4,8 +4,12 @@ compatibility_date = "2024-12-01"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "mails"
-database_id = "REPLACE_WITH_YOUR_DATABASE_ID"
+database_name = "mails-chat-prod"
+database_id = "1fdba7cb-8f19-4c95-a595-c4a47130d47b"
+
+[vars]
+MAILBOX = "chat@canyin.uk"
+OUTBOUND_FROM_EMAIL = "chat@canyin.uk"
 
 # ---- Outbound email providers ----
 #

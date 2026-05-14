@@ -17,6 +17,10 @@ export interface Env {
   MAILBOX?: string
   /** Optional multi-mailbox token map as JSON: {"mailbox@example.com":"token"} */
   AUTH_TOKENS_JSON?: string
+  /** Internal token used by trusted services to act on behalf of any mailbox. */
+  INTERNAL_API_TOKEN?: string
+  /** Fixed sender address allowed for outbound mail, e.g. chat@canyin.uk. */
+  OUTBOUND_FROM_EMAIL?: string
   /** Resend API key for outbound email sending. */
   RESEND_API_KEY?: string
   /** Cloudflare Email Service binding (private beta). */
@@ -27,6 +31,14 @@ export interface Env {
    * silently skipped so existing Resend-only deployments continue to work.
    */
   EMAIL_PROVIDERS?: string
+}
+
+interface CliTokenAuthRow {
+  mailbox: string
+  token_hash: string
+  expires_at: string
+  revoked_at: string | null
+  user_status: 'pending' | 'active' | 'disabled'
 }
 
 export default {
@@ -48,7 +60,7 @@ export default {
     if (url.pathname === '/health') {
       response = Response.json({ ok: true })
     } else if (url.pathname.startsWith('/api/')) {
-      const auth = requireAuthorizedMailbox(request, env)
+      const auth = await requireAuthorizedMailbox(request, env)
       if ('response' in auth) {
         response = auth.response
       } else {
@@ -344,11 +356,6 @@ async function handleGetEmail(url: URL, env: Env, authorizedMailbox: string): Pr
 }
 
 async function handleSend(request: Request, env: Env, authorizedMailbox: string): Promise<Response> {
-  const chain = buildProviderChain(env)
-  if (chain.length === 0) {
-    return Response.json({ error: 'No email provider configured' }, { status: 503 })
-  }
-
   const body = await request.json() as {
     from?: string
     to?: string[]
@@ -369,7 +376,8 @@ async function handleSend(request: Request, env: Env, authorizedMailbox: string)
   }
 
   const senderMailbox = normalizeMailbox(body.from)
-  if (senderMailbox !== authorizedMailbox) {
+  const allowedSender = normalizeMailbox(authorizedMailbox)
+  if (senderMailbox !== allowedSender) {
     return Response.json({ error: 'Forbidden' }, { status: 403 })
   }
 
@@ -383,6 +391,41 @@ async function handleSend(request: Request, env: Env, authorizedMailbox: string)
     cc: body.cc,
     bcc: body.bcc,
     attachments: body.attachments,
+  }
+
+  const localRecipients = await resolveLocalRecipients(env, body.to)
+  if (localRecipients) {
+    const messageId = crypto.randomUUID()
+    await persistOutboundEmail(env, {
+      id: messageId,
+      mailbox: authorizedMailbox,
+      fromAddress: senderMailbox,
+      fromName: parseFromName(body.from),
+      toAddress: body.to.join(', '),
+      subject: body.subject,
+      bodyText: body.text,
+      bodyHtml: body.html,
+      attachmentCount: body.attachments?.length ?? 0,
+      provider: 'local',
+      receivedAt: new Date().toISOString(),
+    })
+
+    await persistLocalInboundEmails(env, {
+      recipients: localRecipients,
+      fromAddress: senderMailbox,
+      fromName: parseFromName(body.from),
+      subject: body.subject,
+      bodyText: body.text,
+      bodyHtml: body.html,
+      replyTo: body.reply_to,
+    })
+
+    return Response.json({ id: messageId, from: body.from, provider: 'local' })
+  }
+
+  const chain = buildProviderChain(env)
+  if (chain.length === 0) {
+    return Response.json({ error: 'No email provider configured' }, { status: 503 })
   }
 
   let result: { id: string; provider: 'cloudflare' | 'resend' }
@@ -399,6 +442,103 @@ async function handleSend(request: Request, env: Env, authorizedMailbox: string)
   }
 
   const now = new Date().toISOString()
+  await persistOutboundEmail(env, {
+    id: result.id,
+    mailbox: authorizedMailbox,
+    fromAddress: senderMailbox,
+    fromName: parseFromName(body.from),
+    toAddress: body.to.join(', '),
+    subject: body.subject,
+    bodyText: body.text,
+    bodyHtml: body.html,
+    attachmentCount: body.attachments?.length ?? 0,
+    provider: result.provider,
+    receivedAt: now,
+  })
+
+  return Response.json({ id: result.id, from: body.from, provider: result.provider })
+}
+
+async function resolveLocalRecipients(env: Env, recipients: string[]): Promise<string[] | null> {
+  const normalizedRecipients = recipients.map(normalizeMailbox)
+  const localDomain = getLocalDomain(env)
+  if (!localDomain || normalizedRecipients.length === 0) {
+    return null
+  }
+
+  if (normalizedRecipients.some((recipient) => !recipient.endsWith(`@${localDomain}`))) {
+    return null
+  }
+
+  const placeholders = normalizedRecipients.map(() => '?').join(', ')
+  const rows = await env.DB.prepare(`
+    SELECT mailbox FROM users WHERE mailbox IN (${placeholders}) AND status = 'active'
+  `).bind(...normalizedRecipients).all<{ mailbox: string }>()
+
+  const matched = new Set((rows.results ?? []).map((row) => normalizeMailbox(row.mailbox)))
+  if (matched.size !== new Set(normalizedRecipients).size) {
+    return null
+  }
+
+  return normalizedRecipients
+}
+
+async function persistLocalInboundEmails(
+  env: Env,
+  input: {
+    recipients: string[]
+    fromAddress: string
+    fromName: string
+    subject: string
+    bodyText?: string
+    bodyHtml?: string
+    replyTo?: string
+  },
+): Promise<void> {
+  const now = new Date().toISOString()
+  const statements = input.recipients.map((recipient) => {
+    const id = crypto.randomUUID()
+    return env.DB.prepare(`
+      INSERT INTO emails (
+        id, mailbox, from_address, from_name, to_address, subject,
+        body_text, body_html, code, headers, metadata, message_id,
+        has_attachments, attachment_count, attachment_names, attachment_search_text,
+        raw_storage_key, direction, status, provider, received_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, '{}', NULL, 0, 0, '', '', NULL, 'inbound', 'received', 'local', ?, ?)
+    `).bind(
+      id,
+      recipient,
+      input.fromAddress,
+      input.fromName,
+      recipient,
+      input.subject,
+      (input.bodyText ?? '').slice(0, 50000),
+      (input.bodyHtml ?? '').slice(0, 100000),
+      JSON.stringify(buildLocalHeaders(input.fromAddress, input.replyTo)),
+      now,
+      now,
+    )
+  })
+
+  await env.DB.batch(statements)
+}
+
+async function persistOutboundEmail(
+  env: Env,
+  input: {
+    id: string
+    mailbox: string
+    fromAddress: string
+    fromName: string
+    toAddress: string
+    subject: string
+    bodyText?: string
+    bodyHtml?: string
+    attachmentCount: number
+    provider: 'cloudflare' | 'resend' | 'local'
+    receivedAt: string
+  },
+): Promise<void> {
   await env.DB.prepare(`
     INSERT INTO emails (
       id, mailbox, from_address, from_name, to_address, subject,
@@ -407,15 +547,38 @@ async function handleSend(request: Request, env: Env, authorizedMailbox: string)
       raw_storage_key, direction, status, provider, received_at, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}', '{}', NULL, ?, ?, '', '', NULL, 'outbound', 'sent', ?, ?, ?)
   `).bind(
-    result.id, authorizedMailbox, senderMailbox, parseFromName(body.from),
-    body.to.join(', '), body.subject,
-    (body.text ?? '').slice(0, 50000), (body.html ?? '').slice(0, 100000),
-    body.attachments?.length ? 1 : 0,
-    body.attachments?.length ?? 0,
-    result.provider, now, now,
+    input.id,
+    input.mailbox,
+    input.fromAddress,
+    input.fromName,
+    input.toAddress,
+    input.subject,
+    (input.bodyText ?? '').slice(0, 50000),
+    (input.bodyHtml ?? '').slice(0, 100000),
+    input.attachmentCount > 0 ? 1 : 0,
+    input.attachmentCount,
+    input.provider,
+    input.receivedAt,
+    input.receivedAt,
   ).run()
+}
 
-  return Response.json({ id: result.id, from: body.from, provider: result.provider })
+function buildLocalHeaders(fromAddress: string, replyTo?: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    from: fromAddress,
+  }
+
+  if (replyTo) {
+    headers['reply-to'] = replyTo
+  }
+
+  return headers
+}
+
+function getLocalDomain(env: Env): string | null {
+  const mailbox = env.OUTBOUND_FROM_EMAIL?.trim().toLowerCase() ?? env.MAILBOX?.trim().toLowerCase() ?? ''
+  const domain = mailbox.split('@')[1] ?? ''
+  return domain || null
 }
 
 async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promise<Response> {
@@ -544,6 +707,10 @@ function normalizeMailbox(value: string): string {
   return mailbox
 }
 
+function isValidEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
+}
+
 function escapeLike(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
 }
@@ -576,45 +743,63 @@ function timingSafeEqual(a: string, b: string): boolean {
   return diff === 0
 }
 
+async function hashCliToken(value: string): Promise<string> {
+  const bytes = new TextEncoder().encode(`cli_token:${value}`)
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return bytesToHex(new Uint8Array(digest))
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
 function getMailboxTokens(env: Env): { tokens?: Map<string, string>; response?: Response } {
+  const tokens = new Map<string, string>()
+
   if (env.AUTH_TOKENS_JSON) {
     try {
       const parsed = JSON.parse(env.AUTH_TOKENS_JSON) as Record<string, unknown>
-      const tokens = new Map<string, string>()
       for (const [mailbox, token] of Object.entries(parsed)) {
         if (typeof token !== 'string' || !token.trim()) {
           return { response: Response.json({ error: 'AUTH_TOKENS_JSON is invalid' }, { status: 503 }) }
         }
         tokens.set(normalizeMailbox(mailbox), token)
       }
-      if (tokens.size === 0) {
-        return { response: Response.json({ error: 'AUTH_TOKENS_JSON is invalid' }, { status: 503 }) }
-      }
-      return { tokens }
     } catch {
       return { response: Response.json({ error: 'AUTH_TOKENS_JSON is invalid' }, { status: 503 }) }
     }
   }
 
-  if (env.AUTH_TOKEN && env.MAILBOX) {
-    return { tokens: new Map([[normalizeMailbox(env.MAILBOX), env.AUTH_TOKEN]]) }
+  if (env.AUTH_TOKEN) {
+    if (!env.MAILBOX) {
+      return { response: Response.json({ error: 'MAILBOX not configured' }, { status: 503 }) }
+    }
+    tokens.set(normalizeMailbox(env.MAILBOX), env.AUTH_TOKEN)
   }
 
-  if (env.AUTH_TOKEN && !env.MAILBOX) {
-    return { response: Response.json({ error: 'MAILBOX not configured' }, { status: 503 }) }
+  if (tokens.size === 0) {
+    return { response: Response.json({ error: 'AUTH_TOKEN not configured' }, { status: 503 }) }
   }
 
-  return { response: Response.json({ error: 'AUTH_TOKEN not configured' }, { status: 503 }) }
+  return { tokens }
 }
 
-function requireAuthorizedMailbox(request: Request, env: Env): { mailbox: string } | { response: Response } {
-  const configured = getMailboxTokens(env)
-  if (configured.response) return { response: configured.response }
-
+async function requireAuthorizedMailbox(request: Request, env: Env): Promise<{ mailbox: string } | { response: Response }> {
   const token = extractBearerToken(request)
   if (!token) {
     return { response: Response.json({ error: 'Unauthorized' }, { status: 401 }) }
   }
+
+  if (env.INTERNAL_API_TOKEN && timingSafeEqual(token, env.INTERNAL_API_TOKEN)) {
+    const mailbox = normalizeMailbox(request.headers.get('X-Mailbox') ?? '')
+    if (!mailbox || !isValidEmail(mailbox)) {
+      return { response: Response.json({ error: 'X-Mailbox is required' }, { status: 400 }) }
+    }
+    return { mailbox }
+  }
+
+  const configured = getMailboxTokens(env)
+  if (configured.response) return { response: configured.response }
 
   let matchedMailbox: string | null = null
   for (const [mailbox, expectedToken] of configured.tokens!) {
@@ -626,9 +811,62 @@ function requireAuthorizedMailbox(request: Request, env: Env): { mailbox: string
     }
   }
 
-  if (!matchedMailbox) {
-    return { response: Response.json({ error: 'Unauthorized' }, { status: 401 }) }
+  if (matchedMailbox) {
+    return { mailbox: matchedMailbox }
   }
 
-  return { mailbox: matchedMailbox }
+  const cliTokenMailbox = await findAuthorizedMailboxByCliToken(env, token)
+  if (cliTokenMailbox) {
+    return { mailbox: cliTokenMailbox }
+  }
+
+  return { response: Response.json({ error: 'Unauthorized' }, { status: 401 }) }
+}
+
+async function findAuthorizedMailboxByCliToken(env: Env, token: string): Promise<string | null> {
+  const tokenId = parseOpaqueTokenId(token)
+  if (!tokenId) {
+    return null
+  }
+
+  const row = await env.DB.prepare(`
+    SELECT users.mailbox AS mailbox, cli_tokens.token_hash AS token_hash,
+           cli_tokens.expires_at AS expires_at, cli_tokens.revoked_at AS revoked_at,
+           users.status AS user_status
+    FROM cli_tokens
+    JOIN users ON users.id = cli_tokens.user_id
+    WHERE cli_tokens.id = ?
+    LIMIT 1
+  `).bind(tokenId).first<CliTokenAuthRow>()
+
+  if (!row) {
+    return null
+  }
+  if (row.user_status !== 'active' || row.revoked_at) {
+    return null
+  }
+  if (new Date(row.expires_at).getTime() <= Date.now()) {
+    return null
+  }
+
+  const expectedHash = await hashCliToken(token)
+  if (!timingSafeEqual(expectedHash, row.token_hash)) {
+    return null
+  }
+
+  await env.DB.prepare(`
+    UPDATE cli_tokens
+    SET last_used_at = ?
+    WHERE id = ?
+  `).bind(new Date().toISOString(), tokenId).run()
+
+  return row.mailbox
+}
+
+function parseOpaqueTokenId(token: string): string | null {
+  const id = token.split('.')[0]?.trim() ?? ''
+  if (!/^[0-9a-f-]{36}$/i.test(id)) {
+    return null
+  }
+  return id
 }
