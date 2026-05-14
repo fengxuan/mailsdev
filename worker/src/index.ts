@@ -23,11 +23,21 @@ export interface Env {
   OUTBOUND_FROM_EMAIL?: string
   /** Resend API key for outbound email sending. */
   RESEND_API_KEY?: string
+  /** AWS SES region for outbound email sending, e.g. us-east-1. */
+  AWS_SES_REGION?: string
+  /** AWS access key id for SES API requests. */
+  AWS_ACCESS_KEY_ID?: string
+  /** AWS secret access key for SES API requests. */
+  AWS_SECRET_ACCESS_KEY?: string
+  /** Optional AWS session token for temporary credentials. */
+  AWS_SESSION_TOKEN?: string
+  /** Optional custom SES endpoint for testing or alternate AWS partitions. */
+  AWS_SES_ENDPOINT?: string
   /** Cloudflare Email Service binding (private beta). */
   EMAIL?: CloudflareEmailBinding
   /**
-   * Ordered provider preference list, e.g. "cloudflare,resend".
-   * Defaults to "cloudflare,resend"; providers lacking configuration are
+   * Ordered provider preference list, e.g. "cloudflare,resend,ses".
+   * Defaults to "cloudflare,resend,ses"; providers lacking configuration are
    * silently skipped so existing Resend-only deployments continue to work.
    */
   EMAIL_PROVIDERS?: string
@@ -512,7 +522,7 @@ async function handleSend(request: Request, env: Env, authorizedMailbox: string)
     return Response.json({ error: 'No email provider configured' }, { status: 503 })
   }
 
-  let result: { id: string; provider: 'cloudflare' | 'resend' }
+  let result: { id: string; provider: 'cloudflare' | 'resend' | 'ses' }
   try {
     result = await sendWithChain(chain, sendReq)
   } catch (err) {
@@ -620,7 +630,7 @@ async function persistOutboundEmail(
     bodyText?: string
     bodyHtml?: string
     attachmentCount: number
-    provider: 'cloudflare' | 'resend' | 'local'
+    provider: 'cloudflare' | 'resend' | 'ses' | 'local'
     receivedAt: string
   },
 ): Promise<void> {

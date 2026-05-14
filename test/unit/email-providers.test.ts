@@ -1,6 +1,7 @@
 import { describe, expect, test, mock } from 'bun:test'
 import { CloudflareProvider } from '../../worker/src/providers/cloudflare'
 import { ResendProvider } from '../../worker/src/providers/resend'
+import { SESProvider } from '../../worker/src/providers/ses'
 import {
   buildProviderChain,
   sendWithChain,
@@ -9,7 +10,9 @@ import {
   AllProvidersFailedError,
   UnsupportedFeatureError,
   type EmailProvider,
+  type ProviderName,
   type SendRequest,
+  type SendResult,
 } from '../../worker/src/providers/types'
 
 const baseReq = (overrides: Partial<SendRequest> = {}): SendRequest => ({
@@ -142,13 +145,95 @@ describe('ResendProvider', () => {
   })
 })
 
+describe('SESProvider', () => {
+  test('supports standard text/html requests but not attachments', () => {
+    const ses = new SESProvider({ accessKeyId: 'akid', secretAccessKey: 'secret' }, { region: 'us-east-1' })
+    expect(ses.supports(baseReq())).toBe(true)
+    expect(ses.supports(baseReq({ html: '<p>hi</p>', cc: ['c@d.com'], bcc: ['e@f.com'] }))).toBe(true)
+    expect(ses.supports(baseReq({ attachments: [{ filename: 'f', content: 'x' }] }))).toBe(false)
+  })
+
+  test('posts signed request to SES v2 API', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(Response.json({ MessageId: 'ses-123' }, { status: 200 })),
+    )
+    const ses = new SESProvider({
+      accessKeyId: 'akid',
+      secretAccessKey: 'secret',
+      sessionToken: 'token',
+    }, {
+      region: 'us-east-1',
+      endpoint: 'https://email.us-east-1.amazonaws.com/v2/email/outbound-emails',
+    }, fetchMock as unknown as typeof fetch)
+
+    const res = await ses.send(baseReq({
+      html: '<p>h</p>',
+      reply_to: 'reply@example.com',
+      cc: ['cc@example.com'],
+      bcc: ['bcc@example.com'],
+    }))
+
+    expect(res).toEqual({ id: 'ses-123', provider: 'ses' })
+
+    const [url, init] = (fetchMock as any).mock.calls[0]
+    expect(url).toBe('https://email.us-east-1.amazonaws.com/v2/email/outbound-emails')
+    expect((init as RequestInit).method).toBe('POST')
+    expect((init as RequestInit).headers['x-amz-date']).toBeDefined()
+    expect((init as RequestInit).headers['x-amz-content-sha256']).toBeDefined()
+    expect((init as RequestInit).headers['x-amz-security-token']).toBe('token')
+    expect((init as RequestInit).headers.authorization).toContain('Credential=akid/')
+    expect((init as RequestInit).headers.authorization).toContain('SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token')
+
+    const body = JSON.parse((init as RequestInit).body as string)
+    expect(body.FromEmailAddress).toBe('me@example.com')
+    expect(body.Destination.ToAddresses).toEqual(['you@example.com'])
+    expect(body.Destination.CcAddresses).toEqual(['cc@example.com'])
+    expect(body.Destination.BccAddresses).toEqual(['bcc@example.com'])
+    expect(body.ReplyToAddresses).toEqual(['reply@example.com'])
+    expect(body.Content.Simple.Subject.Data).toBe('Hi')
+    expect(body.Content.Simple.Body.Text.Data).toBe('Hello')
+    expect(body.Content.Simple.Body.Html.Data).toBe('<p>h</p>')
+  })
+
+  test('throws on non-2xx response', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(Response.json({ message: 'SignatureDoesNotMatch' }, { status: 403 })),
+    )
+    const ses = new SESProvider({ accessKeyId: 'akid', secretAccessKey: 'secret' }, { region: 'us-east-1' }, fetchMock as unknown as typeof fetch)
+    await expect(ses.send(baseReq())).rejects.toThrow('SES: SignatureDoesNotMatch')
+  })
+})
+
 describe('buildProviderChain', () => {
-  test('defaults to cloudflare,resend order', () => {
+  test('defaults to cloudflare,resend,ses order with configured providers only', () => {
     const chain = buildProviderChain({
       EMAIL: { send: async () => ({ id: 'x' }) },
       RESEND_API_KEY: 'k',
+      AWS_SES_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'akid',
+      AWS_SECRET_ACCESS_KEY: 'secret',
     })
-    expect(chain.map(p => p.name)).toEqual(['cloudflare', 'resend'])
+    expect(chain.map(p => p.name)).toEqual(['cloudflare', 'resend', 'ses'])
+  })
+
+  test('includes ses when configured explicitly', () => {
+    const chain = buildProviderChain({
+      AWS_SES_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'akid',
+      AWS_SECRET_ACCESS_KEY: 'secret',
+      EMAIL_PROVIDERS: 'ses',
+    })
+    expect(chain.map(p => p.name)).toEqual(['ses'])
+  })
+
+  test('skips ses when credentials are incomplete', () => {
+    const chain = buildProviderChain({
+      AWS_SES_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'akid',
+      EMAIL_PROVIDERS: 'ses,resend',
+      RESEND_API_KEY: 'k',
+    })
+    expect(chain.map(p => p.name)).toEqual(['resend'])
   })
 
   test('skips cloudflare when no binding', () => {
@@ -156,9 +241,14 @@ describe('buildProviderChain', () => {
     expect(chain.map(p => p.name)).toEqual(['resend'])
   })
 
-  test('skips resend when no api key', () => {
-    const chain = buildProviderChain({ EMAIL: { send: async () => ({}) } })
-    expect(chain.map(p => p.name)).toEqual(['cloudflare'])
+  test('skips resend when no api key but still uses later configured defaults', () => {
+    const chain = buildProviderChain({
+      EMAIL: { send: async () => ({}) },
+      AWS_SES_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'akid',
+      AWS_SECRET_ACCESS_KEY: 'secret',
+    })
+    expect(chain.map(p => p.name)).toEqual(['cloudflare', 'ses'])
   })
 
   test('empty chain when nothing configured', () => {
@@ -179,34 +269,43 @@ describe('buildProviderChain', () => {
     const chain = buildProviderChain({
       EMAIL: { send: async () => ({}) },
       RESEND_API_KEY: 'k',
-      EMAIL_PROVIDERS: 'resend,cloudflare',
+      AWS_SES_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'akid',
+      AWS_SECRET_ACCESS_KEY: 'secret',
+      EMAIL_PROVIDERS: 'ses,resend,cloudflare',
     })
-    expect(chain.map(p => p.name)).toEqual(['resend', 'cloudflare'])
+    expect(chain.map(p => p.name)).toEqual(['ses', 'resend', 'cloudflare'])
   })
 
   test('EMAIL_PROVIDERS dedupes and ignores unknown', () => {
     const chain = buildProviderChain({
       EMAIL: { send: async () => ({}) },
       RESEND_API_KEY: 'k',
-      EMAIL_PROVIDERS: 'resend,resend, bogus, cloudflare',
+      AWS_SES_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'akid',
+      AWS_SECRET_ACCESS_KEY: 'secret',
+      EMAIL_PROVIDERS: 'ses,resend,resend, bogus, cloudflare, ses',
     })
-    expect(chain.map(p => p.name)).toEqual(['resend', 'cloudflare'])
+    expect(chain.map(p => p.name)).toEqual(['ses', 'resend', 'cloudflare'])
   })
 
   test('EMAIL_PROVIDERS empty string falls back to default', () => {
     const chain = buildProviderChain({
       EMAIL: { send: async () => ({}) },
       RESEND_API_KEY: 'k',
+      AWS_SES_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'akid',
+      AWS_SECRET_ACCESS_KEY: 'secret',
       EMAIL_PROVIDERS: '',
     })
-    expect(chain.map(p => p.name)).toEqual(['cloudflare', 'resend'])
+    expect(chain.map(p => p.name)).toEqual(['cloudflare', 'resend', 'ses'])
   })
 })
 
 describe('sendWithChain', () => {
   const makeProvider = (
-    name: 'cloudflare' | 'resend',
-    opts: { supports?: boolean; send?: () => Promise<{ id: string; provider: 'cloudflare' | 'resend' }> } = {},
+    name: ProviderName,
+    opts: { supports?: boolean; send?: () => Promise<SendResult> } = {},
   ): EmailProvider => ({
     name,
     supports: () => opts.supports ?? true,

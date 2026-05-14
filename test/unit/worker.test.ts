@@ -127,9 +127,11 @@ describe('worker: MIME parsing', () => {
 function createMockD1() {
   const boundValues: unknown[] = []
   const runMock = mock(() => Promise.resolve({ success: true }))
+  const allMock = mock(() => Promise.resolve({ results: [] }))
+  const firstMock = mock(() => Promise.resolve(null))
   const bindMock = mock((...args: unknown[]) => {
     boundValues.push(...args)
-    return { run: runMock }
+    return { run: runMock, all: allMock, first: firstMock }
   })
   const prepareMock = mock((_sql: string) => ({
     bind: bindMock,
@@ -139,6 +141,8 @@ function createMockD1() {
     prepareMock,
     bindMock,
     runMock,
+    allMock,
+    firstMock,
     boundValues,
   }
 }
@@ -197,21 +201,22 @@ describe('worker: POST /api/send', () => {
     expect(resendBody.subject).toBe('Hello')
     expect(resendBody.text).toBe('World')
 
-    // Verify D1 insert was called
-    expect(prepareMock).toHaveBeenCalledTimes(1)
-    expect(bindMock).toHaveBeenCalledTimes(1)
-    const boundArgs = (bindMock as any).mock.calls[0]
+    // Verify D1 insert was called after the local-recipient lookup
+    expect(prepareMock).toHaveBeenCalledTimes(2)
+    expect(bindMock).toHaveBeenCalledTimes(2)
+    const boundArgs = (bindMock as any).mock.calls.at(-1)
     expect(boundArgs[0]).toBe('resend-id-123') // id
     expect(boundArgs[1]).toBe('me@example.com') // mailbox
     expect(boundArgs[2]).toBe('me@example.com') // from_address
     expect(boundArgs[3]).toBe('') // from_name
     expect(boundArgs[4]).toBe('you@example.com') // to_address
-    expect(boundArgs[5]).toBe('Hello') // subject
-    expect(boundArgs[6]).toBe('World') // body_text
-    expect(boundArgs[7]).toBe('') // body_html
-    expect(boundArgs[8]).toBe(0) // has_attachments
-    expect(boundArgs[9]).toBe(0) // attachment_count
-    expect(boundArgs[10]).toBe('resend') // provider
+    expect(boundArgs[5]).toBe('you@example.com') // peer_address
+    expect(boundArgs[6]).toBe('Hello') // subject
+    expect(boundArgs[7]).toBe('World') // body_text
+    expect(boundArgs[8]).toBe('') // body_html
+    expect(boundArgs[9]).toBe(0) // has_attachments
+    expect(boundArgs[10]).toBe(0) // attachment_count
+    expect(boundArgs[11]).toBe('resend') // provider
   })
 
   test('returns 400 for missing fields', async () => {
@@ -268,13 +273,13 @@ describe('worker: POST /api/send', () => {
 
   test('returns 503 when AUTH_TOKEN is not configured', async () => {
     const { db } = createMockD1()
-    const env: Env = { DB: db, RESEND_API_KEY: 're_test_key' }
+    const env: Env = { DB: db, RESEND_API_KEY: 're_test_key', MAILBOX: 'me@example.com' }
 
-    const request = new Request('http://localhost/api/send', {
+    const request = authedRequest('http://localhost/api/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(SEND_BODY),
-    })
+    }, 'unused-token')
 
     const response = await worker.fetch(request, env)
     const json = await response.json() as { error: string }
@@ -348,10 +353,10 @@ describe('worker: POST /api/send', () => {
     expect(resendBody.attachments[1].filename).toBe('notes.txt')
     expect(resendBody.attachments[1].content_type).toBeUndefined()
 
-    // Verify D1 records has_attachments
-    const boundArgs = (bindMock as any).mock.calls[0]
-    expect(boundArgs[8]).toBe(1) // has_attachments
-    expect(boundArgs[9]).toBe(2) // attachment_count
+    // Verify D1 records has_attachments on the outbound insert
+    const boundArgs = (bindMock as any).mock.calls.at(-1)
+    expect(boundArgs[9]).toBe(1) // has_attachments
+    expect(boundArgs[10]).toBe(2) // attachment_count
   })
 
   test('returns 502 when all providers fail', async () => {
@@ -377,12 +382,121 @@ describe('worker: POST /api/send', () => {
     expect(json.attempts[0]?.error).toContain('Invalid API key')
   })
 
+  test('sends via SES when selected explicitly', async () => {
+    const { db, bindMock } = createMockD1()
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      AWS_SES_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'akid',
+      AWS_SECRET_ACCESS_KEY: 'secret',
+      EMAIL_PROVIDERS: 'ses',
+    })
+
+    globalThis.fetch = mock(() =>
+      Promise.resolve(Response.json({ MessageId: 'ses-id-42' }, { status: 200 })),
+    ) as typeof fetch
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(SEND_BODY),
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { id: string; provider: string }
+
+    expect(response.status).toBe(200)
+    expect(json.id).toBe('ses-id-42')
+    expect(json.provider).toBe('ses')
+
+    const [sesUrl, sesInit] = (globalThis.fetch as any).mock.calls[0]
+    expect(sesUrl).toBe('https://email.us-east-1.amazonaws.com/v2/email/outbound-emails')
+    expect(sesInit.headers.authorization).toContain('Credential=akid/')
+
+    const boundArgs = (bindMock as any).mock.calls.at(-1)
+    expect(boundArgs[11]).toBe('ses')
+  })
+
+  test('falls back to Resend when SES fails', async () => {
+    const { db } = createMockD1()
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      AWS_SES_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'akid',
+      AWS_SECRET_ACCESS_KEY: 'secret',
+      RESEND_API_KEY: 're_test_key',
+      EMAIL_PROVIDERS: 'ses,resend',
+    })
+
+    globalThis.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('amazonaws.com')) {
+        return Promise.resolve(Response.json({ message: 'SignatureDoesNotMatch' }, { status: 403 }))
+      }
+      return Promise.resolve(Response.json({ id: 'resend-after-ses' }, { status: 200 }))
+    }) as typeof fetch
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(SEND_BODY),
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { provider: string; id: string }
+
+    expect(response.status).toBe(200)
+    expect(json.provider).toBe('resend')
+    expect(json.id).toBe('resend-after-ses')
+    expect((globalThis.fetch as any).mock.calls).toHaveLength(2)
+  })
+
+  test('falls back to Resend when SES does not support attachments', async () => {
+    const { db } = createMockD1()
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      AWS_SES_REGION: 'us-east-1',
+      AWS_ACCESS_KEY_ID: 'akid',
+      AWS_SECRET_ACCESS_KEY: 'secret',
+      RESEND_API_KEY: 're_test_key',
+      EMAIL_PROVIDERS: 'ses,resend',
+    })
+
+    const fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('amazonaws.com')) {
+        return Promise.resolve(Response.json({ MessageId: 'unexpected-ses' }, { status: 200 }))
+      }
+      return Promise.resolve(Response.json({ id: 'resend-attachment' }, { status: 200 }))
+    })
+    globalThis.fetch = fetch as typeof globalThis.fetch
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...SEND_BODY,
+        attachments: [{ filename: 'report.pdf', content: 'base64data', content_type: 'application/pdf' }],
+      }),
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { provider: string; id: string }
+
+    expect(response.status).toBe(200)
+    expect(json.provider).toBe('resend')
+    expect(json.id).toBe('resend-attachment')
+    expect((fetch as any).mock.calls).toHaveLength(1)
+    expect(String((fetch as any).mock.calls[0][0])).toBe('https://api.resend.com/emails')
+  })
+
   test('sends via Cloudflare EMAIL binding when configured', async () => {
     const { db, bindMock } = createMockD1()
     const emailSend = mock(() => Promise.resolve({ messageId: 'cf-id-42' }))
     const env = singleMailboxEnv('me@example.com', {
       DB: db,
       EMAIL: { send: emailSend } as any,
+      EMAIL_PROVIDERS: 'cloudflare',
     })
 
     const request = authedRequest('http://localhost/api/send', {
@@ -400,8 +514,8 @@ describe('worker: POST /api/send', () => {
     expect(emailSend).toHaveBeenCalledTimes(1)
     expect(fetchMock).not.toHaveBeenCalled()
 
-    const boundArgs = (bindMock as any).mock.calls[0]
-    expect(boundArgs[10]).toBe('cloudflare')
+    const boundArgs = (bindMock as any).mock.calls.at(-1)
+    expect(boundArgs[11]).toBe('cloudflare')
   })
 
   test('Cloudflare provider handles attachments/cc/bcc natively', async () => {
@@ -411,6 +525,7 @@ describe('worker: POST /api/send', () => {
       DB: db,
       EMAIL: { send: emailSend } as any,
       RESEND_API_KEY: 're_test_key',
+      EMAIL_PROVIDERS: 'cloudflare,resend',
     })
 
     const request = authedRequest('http://localhost/api/send', {
@@ -446,6 +561,7 @@ describe('worker: POST /api/send', () => {
       DB: db,
       EMAIL: { send: emailSend } as any,
       RESEND_API_KEY: 're_test_key',
+      EMAIL_PROVIDERS: 'cloudflare,resend',
     })
 
     const request = authedRequest('http://localhost/api/send', {

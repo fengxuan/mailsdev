@@ -1,5 +1,6 @@
 import { CloudflareProvider, type CloudflareEmailBinding } from './cloudflare'
 import { ResendProvider } from './resend'
+import { SESProvider } from './ses'
 import {
   AllProvidersFailedError,
   UnsupportedFeatureError,
@@ -12,10 +13,15 @@ import {
 export interface ChainEnv {
   EMAIL?: CloudflareEmailBinding
   RESEND_API_KEY?: string
+  AWS_SES_REGION?: string
+  AWS_ACCESS_KEY_ID?: string
+  AWS_SECRET_ACCESS_KEY?: string
+  AWS_SESSION_TOKEN?: string
+  AWS_SES_ENDPOINT?: string
   EMAIL_PROVIDERS?: string
 }
 
-const DEFAULT_ORDER: ProviderName[] = ['cloudflare', 'resend']
+const DEFAULT_ORDER: ProviderName[] = ['cloudflare', 'resend', 'ses']
 
 export function buildProviderChain(env: ChainEnv, fetchImpl: typeof fetch = fetch): EmailProvider[] {
   const order = parseOrder(env.EMAIL_PROVIDERS)
@@ -25,6 +31,20 @@ export function buildProviderChain(env: ChainEnv, fetchImpl: typeof fetch = fetc
       chain.push(new CloudflareProvider(env.EMAIL))
     } else if (name === 'resend' && env.RESEND_API_KEY) {
       chain.push(new ResendProvider(env.RESEND_API_KEY, fetchImpl))
+    } else if (
+      name === 'ses'
+      && env.AWS_SES_REGION
+      && env.AWS_ACCESS_KEY_ID
+      && env.AWS_SECRET_ACCESS_KEY
+    ) {
+      chain.push(new SESProvider({
+        accessKeyId: env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+        ...(env.AWS_SESSION_TOKEN ? { sessionToken: env.AWS_SESSION_TOKEN } : {}),
+      }, {
+        region: env.AWS_SES_REGION,
+        ...(env.AWS_SES_ENDPOINT ? { endpoint: env.AWS_SES_ENDPOINT } : {}),
+      }, fetchImpl))
     }
   }
   return chain
@@ -74,7 +94,7 @@ function parseOrder(raw: string | undefined): ProviderName[] {
   const valid: ProviderName[] = []
   const seen = new Set<string>()
   for (const name of names) {
-    if (name === 'cloudflare' || name === 'resend') {
+    if (name === 'cloudflare' || name === 'resend' || name === 'ses') {
       if (!seen.has(name)) {
         valid.push(name)
         seen.add(name)

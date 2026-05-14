@@ -55,13 +55,13 @@ AIエージェント向けのメールインフラ。プログラムでメール
 
 ## 特徴
 
-- **メール送信** — プロバイダチェーン：Cloudflare Email Service（ネイティブ `env.EMAIL.send()` バインディング、パブリックベータ）と Resend のフォールバック。デフォルト順序 `cloudflare,resend`、`EMAIL_PROVIDERS` で上書き可能
+- **メール送信** — プロバイダチェーン：Cloudflare Email Service（ネイティブ `env.EMAIL.send()` バインディング、パブリックベータ）と Resend / AWS SES のフォールバック。デフォルト順序 `cloudflare,resend,ses`、`EMAIL_PROVIDERS` で上書き可能
 - **メール受信** — Cloudflare Email Routing Worker経由
 - **受信箱検索** — キーワードで件名、本文、送信者、認証コードを検索
 - **認証コード自動抽出** — メールから認証コードを自動検出（英/中/日/韓対応）
 - **添付ファイル** — CLIの `--attach` またはSDKで送信、MIME添付ファイルの受信・解析
 - **ストレージプロバイダー** — ローカルSQLite、[db9.ai](https://db9.ai)クラウドPostgreSQL、またはリモートWorker API
-- **プロバイダ可視化** — `/api/send` レスポンスと `/api/inbox` の outbound 行に `provider` フィールド（`cloudflare`/`resend`）が含まれ、実際にどちらが配信したか確認できる
+- **プロバイダ可視化** — `/api/send` レスポンスと `/api/inbox` の outbound 行に `provider` フィールド（`cloudflare`/`ses`/`resend`）が含まれ、実際にどれが配信したか確認できる
 - **ゼロランタイム依存** — プロバイダは全て Workers バインディングまたは `fetch()` を直接使用、SDK なし
 - **ホスティングサービス** — `mails claim` で無料 `@mails.dev` メールアドレス取得
 - **セルフホスト** — 独自Workerデプロイ、メールボックス単位の token 認証
@@ -98,12 +98,18 @@ Resendキー不要 — ホスティングユーザーは月100通無料。無制
 cd worker && wrangler deploy             # 独自Workerをデプロイ
 # 送信プロバイダを最低1つ設定：
 wrangler secret put RESEND_API_KEY       # オプションA：Resend
-#   オプションB：Cloudflare Email Service（パブリックベータ）— wrangler.toml に追加：
+wrangler secret put AWS_SES_REGION       # オプションB：AWS SES
+wrangler secret put AWS_ACCESS_KEY_ID
+wrangler secret put AWS_SECRET_ACCESS_KEY
+# wrangler secret put AWS_SESSION_TOKEN  # 一時的なAWS認証情報で任意
+# wrangler secret put AWS_SES_ENDPOINT   # カスタムendpoint / AWSパーティションで任意
+#   オプションC：Cloudflare Email Service（パブリックベータ）— wrangler.toml に追加：
 #   [[send_email]]
 #   name = "EMAIL"
-# 両方設定時、デフォルトの優先順位は cloudflare → resend。
-# 順序の強制 / 片方無効化：
-#   wrangler secret put EMAIL_PROVIDERS   # 例: "resend" または "cloudflare,resend"
+# 複数プロバイダを併用可能。デフォルト順序は cloudflare → resend → ses です。
+# 順序を固定したり一部を無効化する場合は：
+#   wrangler secret put EMAIL_PROVIDERS   # 例: "resend"、"ses,resend"、"cloudflare,resend,ses"
+# 現在の SES は標準的な text/html 送信をサポートし、添付ファイル付きは後続プロバイダ（Resend など）へフォールバックします。
 #
 # 単一メールボックス:
 #   MAILBOX=agent@yourdomain.com

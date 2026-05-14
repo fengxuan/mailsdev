@@ -55,14 +55,14 @@ Email infrastructure for AI agents. Send and receive emails programmatically.
 
 ## Features
 
-- **Send emails** via a provider chain — Cloudflare Email Service (native `env.EMAIL.send()` binding, public beta) with Resend as fallback; default order is `cloudflare,resend`, override with `EMAIL_PROVIDERS`
+- **Send emails** via a provider chain — Cloudflare Email Service (native `env.EMAIL.send()` binding, public beta) with Resend and AWS SES as fallbacks; default order is `cloudflare,resend,ses`, override with `EMAIL_PROVIDERS`
 - **Receive emails** via Cloudflare Email Routing Worker
 - **Search inbox** — keyword search across subject, body, sender, code
 - **Verification code extraction** — auto-extracts codes from emails (EN/ZH/JA/KO)
 - **Attachments** — send files via CLI (`--attach`) or SDK, receive and parse MIME attachments
 - **Storage providers** — local SQLite, [db9.ai](https://db9.ai) cloud PostgreSQL, or remote Worker API
-- **Provider transparency** — `/api/send` response and `/api/inbox` outbound rows carry a `provider` field (`cloudflare`/`resend`) so you can see which backend actually delivered
-- **Zero runtime dependencies** — both providers call the Workers binding or raw `fetch()` directly, no SDK
+- **Provider transparency** — `/api/send` response and `/api/inbox` outbound rows carry a `provider` field (`cloudflare`/`ses`/`resend`) so you can see which backend actually delivered
+- **Zero runtime dependencies** — providers call Workers bindings or raw `fetch()` directly, no SDK
 - **Hosted service** — free `@mails.dev` mailboxes via `mails claim`
 - **Self-hosted** — deploy your own Worker with mailbox-scoped auth tokens
 
@@ -98,12 +98,18 @@ No Resend key needed — hosted users get 100 free sends/month. For unlimited se
 cd worker && wrangler deploy             # Deploy your own Worker
 # Choose at least one outbound provider:
 wrangler secret put RESEND_API_KEY       # Option A: Resend
-#   Option B: Cloudflare Email Service (public beta) — add to wrangler.toml:
+wrangler secret put AWS_SES_REGION       # Option B: AWS SES
+wrangler secret put AWS_ACCESS_KEY_ID
+wrangler secret put AWS_SECRET_ACCESS_KEY
+# wrangler secret put AWS_SESSION_TOKEN  # Optional for temporary AWS credentials
+# wrangler secret put AWS_SES_ENDPOINT   # Optional custom endpoint / AWS partition
+#   Option C: Cloudflare Email Service (public beta) — add to wrangler.toml:
 #   [[send_email]]
 #   name = "EMAIL"
-# Both can be configured; default chain tries cloudflare → resend.
-# Force order / disable one via:
-#   wrangler secret put EMAIL_PROVIDERS   # e.g. "resend" or "cloudflare,resend"
+# Providers can be combined; default chain stays on cloudflare → resend → ses.
+# Use EMAIL_PROVIDERS to force order or disable providers, for example:
+#   wrangler secret put EMAIL_PROVIDERS   # e.g. "resend", "ses,resend", or "cloudflare,resend,ses"
+# SES currently supports standard text/html sends; attachment requests will fall back to later providers such as Resend.
 #
 # Single mailbox:
 #   MAILBOX=agent@yourdomain.com

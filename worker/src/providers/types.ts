@@ -16,7 +16,7 @@ export interface SendRequest {
   attachments?: SendAttachment[]
 }
 
-export type ProviderName = 'cloudflare' | 'resend'
+export type ProviderName = 'cloudflare' | 'resend' | 'ses'
 
 export interface SendResult {
   id: string
