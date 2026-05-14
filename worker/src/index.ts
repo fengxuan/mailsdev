@@ -41,6 +41,16 @@ interface CliTokenAuthRow {
   user_status: 'pending' | 'active' | 'disabled'
 }
 
+interface ConversationSummaryRow {
+  peer_address: string
+  id: string
+  direction: 'inbound' | 'outbound'
+  status: 'received' | 'sent' | 'failed' | 'queued'
+  body_text: string
+  body_html: string
+  received_at: string
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
@@ -73,6 +83,9 @@ export default {
             break
           case '/api/email':
             response = await handleGetEmail(url, env, auth.mailbox)
+            break
+          case '/api/conversations':
+            response = await handleConversations(url, env, auth.mailbox)
             break
           case '/api/send':
             if (request.method !== 'POST') {
@@ -263,6 +276,76 @@ async function handleInbox(url: URL, env: Env, authorizedMailbox: string): Promi
 
   return Response.json({
     emails: rows.results.map((row) => toInboxEmail(row as Record<string, unknown>)),
+  })
+}
+
+async function handleConversations(url: URL, env: Env, authorizedMailbox: string): Promise<Response> {
+  const to = url.searchParams.get('to')
+  if (!to) return Response.json({ error: 'Missing ?to= parameter' }, { status: 400 })
+  if (normalizeMailbox(to) !== authorizedMailbox) {
+    return Response.json({ error: 'Forbidden' }, { status: 403 })
+  }
+
+  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '20', 10) || 20, 100)
+  const before = optionalIsoTime(url.searchParams.get('before'))
+  const params: Array<string | number> = [authorizedMailbox]
+  const beforeFilter = before ? ' AND e.received_at < ?' : ''
+
+  if (before) {
+    params.push(before)
+  }
+
+  const rows = await env.DB.prepare(`
+    WITH latest_per_peer AS (
+      SELECT
+        peer_address,
+        MAX(received_at) AS last_at
+      FROM emails
+      WHERE mailbox = ?
+        AND peer_address IS NOT NULL
+        AND peer_address != ''
+        ${before ? 'AND received_at < ?' : ''}
+      GROUP BY peer_address
+    ), ranked AS (
+      SELECT
+        e.peer_address,
+        e.id,
+        e.direction,
+        e.status,
+        e.body_text,
+        e.body_html,
+        e.received_at,
+        ROW_NUMBER() OVER (
+          PARTITION BY e.peer_address
+          ORDER BY e.received_at DESC, e.id DESC
+        ) AS row_num
+      FROM emails e
+      INNER JOIN latest_per_peer latest
+        ON latest.peer_address = e.peer_address
+       AND latest.last_at = e.received_at
+      WHERE e.mailbox = ?
+        ${beforeFilter}
+    )
+    SELECT peer_address, id, direction, status, body_text, body_html, received_at
+    FROM ranked
+    WHERE row_num = 1
+    ORDER BY received_at DESC, id DESC
+    LIMIT ?
+  `).bind(...params, authorizedMailbox, ...(before ? [before] : []), limit).all<ConversationSummaryRow>()
+
+  return Response.json({
+    conversations: (rows.results ?? []).map((row) => ({
+      peer: row.peer_address,
+      email: {
+        id: row.id,
+        direction: row.direction,
+        status: row.status,
+        body_text: row.body_text,
+        body_html: row.body_html,
+        received_at: row.received_at,
+      },
+    })),
+    next_cursor: null,
   })
 }
 
