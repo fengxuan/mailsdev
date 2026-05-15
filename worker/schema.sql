@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT NOT NULL,
   mailbox TEXT NOT NULL,
+  display_name TEXT,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'active', 'disabled')),
   email_verified_at TEXT,
   created_at TEXT NOT NULL,
