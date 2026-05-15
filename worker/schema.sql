@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
   revoked_at TEXT,
   replaced_by_id TEXT,
   device_name TEXT,
+  device_id TEXT,
   created_at TEXT NOT NULL,
   last_used_at TEXT,
   FOREIGN KEY (user_id) REFERENCES users(id)
@@ -115,5 +116,6 @@ CREATE INDEX IF NOT EXISTS idx_challenges_user_expires ON email_verification_cha
 CREATE INDEX IF NOT EXISTS idx_challenges_email_consumed ON email_verification_challenges(email, consumed_at, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_revoked ON refresh_tokens(user_id, revoked_at, expires_at DESC);
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_device ON refresh_tokens(user_id, device_id, revoked_at, expires_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cli_tokens_hash ON cli_tokens(token_hash);
 CREATE INDEX IF NOT EXISTS idx_cli_tokens_user_revoked ON cli_tokens(user_id, revoked_at, expires_at DESC);
