@@ -10,3 +10,5 @@ escape.txt
 docs/bugs-*.md
 worker/.wrangler/
 deploy/
+.wrangler
+
