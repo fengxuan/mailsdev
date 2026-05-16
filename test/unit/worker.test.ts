@@ -961,6 +961,43 @@ describe('worker: GET /api/sync', () => {
     expect(json.has_more).toBe(true)
   })
 
+  test('falls back to from/to matching when peer_address is null', async () => {
+    const capturedSqls: string[] = []
+    const capturedBinds: Array<{ sql: string; args: unknown[] }> = []
+    const db = {
+      prepare: mock((sql: string) => {
+        capturedSqls.push(sql)
+        return {
+          bind: mock((...args: unknown[]) => {
+            capturedBinds.push({ sql, args })
+            return {
+              first: mock(() => Promise.resolve({ total: 1 })),
+              all: mock(() => Promise.resolve({ results: [makeSyncEmail({ peer_address: null, from_address: 'friend@example.com' })] })),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = singleMailboxEnv('user@test.com', { DB: db })
+    const response = await worker.fetch(
+      authedRequest('http://localhost/api/sync?to=user@test.com&peer=friend@example.com&since=1970-01-01T00:00:00Z&limit=1'),
+      env,
+    )
+    const json = await response.json() as { emails: any[] }
+
+    expect(response.status).toBe(200)
+    expect(json.emails).toHaveLength(1)
+    const messageQuery = capturedSqls.find((sql) => sql.includes('SELECT * FROM emails'))
+    expect(messageQuery).toBeTruthy()
+    expect(messageQuery!).toContain('peer_address = ?')
+    expect(messageQuery!).toContain("peer_address IS NULL AND direction = 'inbound'")
+    expect(messageQuery!).toContain("peer_address IS NULL AND direction = 'outbound'")
+    const messageBind = capturedBinds.find((entry) => entry.sql.includes('SELECT * FROM emails'))
+    expect(messageBind).toBeTruthy()
+    expect(messageBind!.args.slice(2, 5)).toEqual(['friend@example.com', 'friend@example.com', 'friend@example.com'])
+  })
+
   test('requires auth when AUTH_TOKEN set', async () => {
     const { db } = createSyncMockD1()
     const env: Env = { DB: db, AUTH_TOKEN: 'secret123', MAILBOX: 'user@test.com' }

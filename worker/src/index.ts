@@ -687,6 +687,7 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   const since = url.searchParams.get('since') || '1970-01-01T00:00:00Z'
   const peer = optionalPeer(url.searchParams.get('peer'))
   const before = optionalIsoTime(url.searchParams.get('before'))
+  const beforeId = optionalCursorId(url.searchParams.get('before_id'))
   const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '100'), 500)
   const offset = parseInt(url.searchParams.get('offset') ?? '0')
 
@@ -694,13 +695,22 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   const params: Array<string | number> = [authorizedMailbox, since]
 
   if (peer) {
-    whereParts.push('peer_address = ?')
-    params.push(peer)
+    whereParts.push(`(
+      peer_address = ?
+      OR (peer_address IS NULL AND direction = 'inbound' AND lower(trim(from_address)) = ?)
+      OR (peer_address IS NULL AND direction = 'outbound' AND instr(to_address, ',') = 0 AND lower(trim(to_address)) = ?)
+    )`)
+    params.push(peer, peer, peer)
   }
 
   if (before) {
-    whereParts.push('received_at < ?')
-    params.push(before)
+    if (peer && beforeId) {
+      whereParts.push('(received_at < ? OR (received_at = ? AND id < ?))')
+      params.push(before, before, beforeId)
+    } else {
+      whereParts.push('received_at < ?')
+      params.push(before)
+    }
   }
 
   const whereClause = whereParts.join(' AND ')
@@ -710,12 +720,14 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   ).bind(...params).first<{ total: number }>()
   const total = countRow?.total ?? 0
 
-  const rowOrder = peer ? 'DESC' : 'ASC'
+  const orderBy = peer
+    ? 'received_at DESC, id DESC'
+    : 'received_at ASC, id ASC'
 
   const rows = await env.DB.prepare(`
     SELECT * FROM emails
     WHERE ${whereClause}
-    ORDER BY received_at ${rowOrder}
+    ORDER BY ${orderBy}
     LIMIT ? OFFSET ?
   `).bind(...params, limit, offset).all()
 
@@ -820,6 +832,12 @@ function optionalPeer(value: string | null): string | undefined {
 }
 
 function optionalIsoTime(value: string | null): string | undefined {
+  const trimmed = value?.trim()
+  if (!trimmed) return undefined
+  return trimmed
+}
+
+function optionalCursorId(value: string | null): string | undefined {
   const trimmed = value?.trim()
   if (!trimmed) return undefined
   return trimmed
