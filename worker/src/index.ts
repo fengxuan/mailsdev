@@ -65,6 +65,18 @@ interface ConversationSummaryRow {
   received_at: string
 }
 
+type RealtimeNotifyScope = 'direct' | 'group'
+type RealtimeNotifyDirection = 'inbound' | 'outbound'
+
+interface RealtimeNotifyEvent {
+  targetUserId: string
+  mailbox: string
+  source: string
+  scope: RealtimeNotifyScope
+  peer: string
+  direction: RealtimeNotifyDirection
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
@@ -198,7 +210,11 @@ export default {
     ]
 
     await env.DB.batch(statements)
-    scheduleRealtimeNotifyForMailbox(env, ctx, mailbox, 'email_inbound')
+    scheduleRealtimeNotifyForIncomingMailbox(env, ctx, {
+      mailbox,
+      senderMailbox: fromAddress,
+      source: 'email_inbound',
+    })
   },
 } satisfies ExportedHandler<Env>
 
@@ -501,6 +517,7 @@ async function handleSend(
   if (localRecipients) {
     const normalizedAuthorizedMailbox = normalizeMailbox(authorizedMailbox)
     const localInboundRecipients = localRecipients.filter((recipient) => recipient !== normalizedAuthorizedMailbox)
+    const primaryRecipient = localRecipients.length === 1 ? localRecipients[0] ?? null : null
     const messageId = crypto.randomUUID()
     await persistOutboundEmail(env, {
       id: messageId,
@@ -526,7 +543,22 @@ async function handleSend(
         bodyHtml: body.html,
         replyTo: body.reply_to,
       })
-      scheduleRealtimeNotifyForMailboxes(env, ctx, localInboundRecipients, 'local_inbound')
+      scheduleRealtimeNotifyForIncomingMailboxes(env, ctx, {
+        mailboxes: localInboundRecipients,
+        senderMailbox,
+        source: 'local_inbound',
+      })
+    }
+
+    if (primaryRecipient && isRealtimeNotifyConfigured(env)) {
+      const isDirectRecipient = await isDirectConversationRecipientMailbox(env, primaryRecipient)
+      if (isDirectRecipient) {
+        scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
+          senderMailbox,
+          peerMailbox: primaryRecipient,
+          source: 'send_direct_outbound',
+        })
+      }
     }
 
     return Response.json({ id: messageId, from: body.from, provider: 'local' })
@@ -564,6 +596,18 @@ async function handleSend(
     provider: result.provider,
     receivedAt: now,
   })
+
+  const primaryRecipient = body.to.length === 1 ? normalizeMailbox(body.to[0] ?? '') : null
+  if (primaryRecipient && isRealtimeNotifyConfigured(env)) {
+    const isDirectRecipient = await isDirectConversationRecipientMailbox(env, primaryRecipient)
+    if (isDirectRecipient) {
+      scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
+        senderMailbox,
+        peerMailbox: primaryRecipient,
+        source: 'send_direct_outbound',
+      })
+    }
+  }
 
   return Response.json({ id: result.id, from: body.from, provider: result.provider })
 }
@@ -889,90 +933,256 @@ function safeJsonParse<T>(value: string | null | undefined, fallback: T): T {
   }
 }
 
-function scheduleRealtimeNotifyForMailboxes(
+function isRealtimeNotifyConfigured(env: Env): boolean {
+  return Boolean(env.REALTIME_NOTIFY_BASE_URL?.trim() && env.REALTIME_INTERNAL_TOKEN?.trim())
+}
+
+function scheduleRealtimeNotifyForIncomingMailboxes(
   env: Env,
   ctx: ExecutionContext | undefined,
-  mailboxes: string[],
-  source: string,
+  input: { mailboxes: string[]; senderMailbox: string; source: string },
 ): void {
-  const uniqueMailboxes = [...new Set(mailboxes.map(normalizeMailbox))]
+  const uniqueMailboxes = [...new Set(input.mailboxes.map(normalizeMailbox))]
   for (const mailbox of uniqueMailboxes) {
-    scheduleRealtimeNotifyForMailbox(env, ctx, mailbox, source)
+    scheduleRealtimeNotifyForIncomingMailbox(env, ctx, {
+      mailbox,
+      senderMailbox: input.senderMailbox,
+      source: input.source,
+    })
   }
 }
 
-function scheduleRealtimeNotifyForMailbox(
+function scheduleRealtimeNotifyForIncomingMailbox(
   env: Env,
   ctx: ExecutionContext | undefined,
-  mailbox: string,
-  source: string,
+  input: { mailbox: string; senderMailbox: string; source: string },
 ): void {
-  if (!env.REALTIME_NOTIFY_BASE_URL?.trim() || !env.REALTIME_INTERNAL_TOKEN?.trim()) {
+  if (!isRealtimeNotifyConfigured(env)) {
     return
   }
 
   runBackground(ctx, (async () => {
     try {
-      const userId = await findActiveDirectUserIdByMailbox(env, mailbox)
-      if (!userId) {
-        return
-      }
-
-      const event = {
-        v: 1 as const,
-        type: 'conversations_dirty' as const,
-        event_id: crypto.randomUUID(),
-        emitted_at: new Date().toISOString(),
-        target: {
-          user_id: userId,
-        },
-        data: {
-          scope: 'direct' as const,
-        },
-      }
-
-      const response = await fetch(new URL('/internal/notify', env.REALTIME_NOTIFY_BASE_URL), {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${env.REALTIME_INTERNAL_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(event),
+      const events = await resolveRealtimeEventsForIncomingMailbox(env, {
+        mailbox: input.mailbox,
+        senderMailbox: input.senderMailbox,
+        source: input.source,
       })
-
-      if (!response.ok) {
-        console.warn(JSON.stringify({
-          event: 'realtime_notify_failed',
-          source: 'mails-worker',
-          trigger_source: source,
-          event_id: event.event_id,
-          type: event.type,
-          target_user_id: userId,
-          mailbox,
-          status: response.status,
-        }))
-        return
+      for (const event of events) {
+        await sendRealtimeNotifyEvent(env, event)
       }
-
-      console.log(JSON.stringify({
-        event: 'realtime_notify_sent',
-        source: 'mails-worker',
-        trigger_source: source,
-        event_id: event.event_id,
-        type: event.type,
-        target_user_id: userId,
-        mailbox,
-      }))
     } catch (error) {
       console.warn(JSON.stringify({
         event: 'realtime_notify_failed',
         source: 'mails-worker',
-        trigger_source: source,
-        mailbox,
+        trigger_source: input.source,
+        mailbox: normalizeMailbox(input.mailbox),
+        sender_mailbox: normalizeMailbox(input.senderMailbox),
         error: error instanceof Error ? error.message : String(error),
       }))
     }
   })())
+}
+
+function scheduleRealtimeNotifyForDirectOutboundSender(
+  env: Env,
+  ctx: ExecutionContext | undefined,
+  input: { senderMailbox: string; peerMailbox: string; source: string },
+): void {
+  if (!isRealtimeNotifyConfigured(env)) {
+    return
+  }
+
+  runBackground(ctx, (async () => {
+    try {
+      const event = await resolveRealtimeEventForDirectOutboundSender(env, input)
+      if (!event) return
+      await sendRealtimeNotifyEvent(env, event)
+    } catch (error) {
+      console.warn(JSON.stringify({
+        event: 'realtime_notify_failed',
+        source: 'mails-worker',
+        trigger_source: input.source,
+        mailbox: normalizeMailbox(input.senderMailbox),
+        peer: normalizeMailbox(input.peerMailbox),
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    }
+  })())
+}
+
+async function sendRealtimeNotifyEvent(env: Env, event: RealtimeNotifyEvent): Promise<void> {
+  const envelope = {
+    v: 1 as const,
+    type: 'conversations_dirty' as const,
+    event_id: crypto.randomUUID(),
+    emitted_at: new Date().toISOString(),
+    target: {
+      user_id: event.targetUserId,
+    },
+    data: {
+      scope: event.scope,
+      peer: event.peer,
+      direction: event.direction,
+    },
+  }
+
+  const response = await fetch(new URL('/internal/notify', env.REALTIME_NOTIFY_BASE_URL), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.REALTIME_INTERNAL_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(envelope),
+  })
+
+  if (!response.ok) {
+    console.warn(JSON.stringify({
+      event: 'realtime_notify_failed',
+      source: 'mails-worker',
+      trigger_source: event.source,
+      event_id: envelope.event_id,
+      type: envelope.type,
+      target_user_id: event.targetUserId,
+      mailbox: event.mailbox,
+      scope: event.scope,
+      peer: event.peer,
+      direction: event.direction,
+      status: response.status,
+    }))
+    return
+  }
+
+  console.log(JSON.stringify({
+    event: 'realtime_notify_sent',
+    source: 'mails-worker',
+    trigger_source: event.source,
+    event_id: envelope.event_id,
+    type: envelope.type,
+    target_user_id: event.targetUserId,
+    mailbox: event.mailbox,
+    scope: event.scope,
+    peer: event.peer,
+    direction: event.direction,
+  }))
+}
+
+async function resolveRealtimeEventsForIncomingMailbox(
+  env: Env,
+  input: { mailbox: string; senderMailbox: string; source: string },
+): Promise<RealtimeNotifyEvent[]> {
+  const normalizedMailbox = normalizeMailbox(input.mailbox)
+  const normalizedSenderMailbox = normalizeMailbox(input.senderMailbox)
+  const group = await getActiveChatGroupByMailbox(env, normalizedMailbox)
+  if (group) {
+    const members = await listActiveChatGroupRealtimeMembers(env, group.id)
+    const uniqueMembers = new Map<string, string>()
+    for (const member of members) {
+      if (!member.user_id) continue
+      uniqueMembers.set(member.user_id, normalizeMailbox(member.member_mailbox))
+    }
+    return [...uniqueMembers.entries()].map(([targetUserId, memberMailbox]) => ({
+      targetUserId,
+      mailbox: group.mailbox,
+      source: input.source,
+      scope: 'group' as const,
+      peer: group.mailbox,
+      direction: memberMailbox === normalizedSenderMailbox ? 'outbound' : 'inbound',
+    }))
+  }
+
+  const directUserId = await findActiveDirectUserIdByMailbox(env, normalizedMailbox)
+  if (!directUserId) {
+    return []
+  }
+
+  return [{
+    targetUserId: directUserId,
+    mailbox: normalizedMailbox,
+    source: input.source,
+    scope: 'direct',
+    peer: normalizedSenderMailbox,
+    direction: 'inbound',
+  }]
+}
+
+async function resolveRealtimeEventForDirectOutboundSender(
+  env: Env,
+  input: { senderMailbox: string; peerMailbox: string; source: string },
+): Promise<RealtimeNotifyEvent | null> {
+  const normalizedSenderMailbox = normalizeMailbox(input.senderMailbox)
+  const normalizedPeerMailbox = normalizeMailbox(input.peerMailbox)
+  const senderUserId = await findActiveDirectUserIdByMailbox(env, normalizedSenderMailbox)
+  if (!senderUserId) return null
+  return {
+    targetUserId: senderUserId,
+    mailbox: normalizedSenderMailbox,
+    source: input.source,
+    scope: 'direct',
+    peer: normalizedPeerMailbox,
+    direction: 'outbound',
+  }
+}
+
+async function isDirectConversationRecipientMailbox(env: Env, mailbox: string): Promise<boolean> {
+  const normalizedMailbox = normalizeMailbox(mailbox)
+  if (!normalizedMailbox || !isValidEmail(normalizedMailbox)) {
+    return false
+  }
+  const group = await getActiveChatGroupByMailbox(env, normalizedMailbox)
+  return !group
+}
+
+async function getActiveChatGroupByMailbox(
+  env: Env,
+  mailbox: string,
+): Promise<{ id: string; mailbox: string } | null> {
+  try {
+    const group = await env.DB.prepare(`
+      SELECT id, mailbox
+      FROM chat_groups
+      WHERE mailbox = ? AND status = 'active'
+      LIMIT 1
+    `).bind(normalizeMailbox(mailbox)).first<{ id: string; mailbox: string }>()
+    if (!group) return null
+    return {
+      id: group.id,
+      mailbox: normalizeMailbox(group.mailbox),
+    }
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: 'realtime_notify_lookup_failed',
+      source: 'mails-worker',
+      mailbox: normalizeMailbox(mailbox),
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    return null
+  }
+}
+
+async function listActiveChatGroupRealtimeMembers(
+  env: Env,
+  groupId: string,
+): Promise<Array<{ user_id: string; member_mailbox: string }>> {
+  try {
+    const rows = await env.DB.prepare(`
+      SELECT m.user_id, m.member_mailbox
+      FROM chat_group_members m
+      INNER JOIN users u ON u.id = m.user_id
+      WHERE m.group_id = ?
+        AND m.status = 'active'
+        AND u.status = 'active'
+    `).bind(groupId).all<{ user_id: string; member_mailbox: string }>()
+    return rows.results ?? []
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: 'realtime_notify_lookup_failed',
+      source: 'mails-worker',
+      group_id: groupId,
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    return []
+  }
 }
 
 async function findActiveDirectUserIdByMailbox(env: Env, mailbox: string): Promise<string | null> {

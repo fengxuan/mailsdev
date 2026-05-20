@@ -10,7 +10,7 @@ database_id = "1fdba7cb-8f19-4c95-a595-c4a47130d47b"
 [vars]
 MAILBOX = "chat@canyin.uk"
 OUTBOUND_FROM_EMAIL = "chat@canyin.uk"
-REALTIME_NOTIFY_BASE_URL = "https://mails-realtime-notify.canyin.uk"
+REALTIME_NOTIFY_BASE_URL = "https://mails-realtime-notify.lineme.workers.dev"
 
 # ---- Outbound email providers ----
 #

@@ -147,6 +147,104 @@ function createMockD1() {
   }
 }
 
+interface RealtimeRoutingFixtures {
+  localUsers?: string[]
+  directUsersByMailbox?: Record<string, string>
+  groupsByMailbox?: Record<string, { id: string; mailbox: string }>
+  groupMembersByGroupID?: Record<string, Array<{ user_id: string; member_mailbox: string }>>
+}
+
+function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
+  const normalize = (value: unknown): string => String(value ?? '').trim().toLowerCase()
+  const localUsers = new Set((fixtures.localUsers ?? []).map(normalize))
+  const directUsersByMailbox = Object.fromEntries(
+    Object.entries(fixtures.directUsersByMailbox ?? {}).map(([mailbox, userID]) => [normalize(mailbox), userID]),
+  )
+  const groupsByMailbox = Object.fromEntries(
+    Object.entries(fixtures.groupsByMailbox ?? {}).map(([mailbox, group]) => [normalize(mailbox), group]),
+  )
+  const groupMembersByGroupID = fixtures.groupMembersByGroupID ?? {}
+  const defaultResult = {
+    run: async () => ({ success: true }),
+    all: async () => ({ results: [] as Array<Record<string, unknown>> }),
+    first: async () => null as Record<string, unknown> | null,
+  }
+
+  const prepareMock = mock((sql: string) => ({
+    bind: (...args: unknown[]) => {
+      if (sql.includes('SELECT mailbox FROM users WHERE mailbox IN')) {
+        return {
+          ...defaultResult,
+          all: async () => ({
+            results: args
+              .map((arg) => normalize(arg))
+              .filter((mailbox) => localUsers.has(mailbox))
+              .map((mailbox) => ({ mailbox })),
+          }),
+        }
+      }
+
+      if (sql.includes('FROM chat_groups') && sql.includes("WHERE mailbox = ? AND status = 'active'")) {
+        return {
+          ...defaultResult,
+          first: async () => {
+            const mailbox = normalize(args[0])
+            const group = groupsByMailbox[mailbox]
+            return group ? { id: group.id, mailbox: group.mailbox } : null
+          },
+        }
+      }
+
+      if (sql.includes('FROM chat_group_members m') && sql.includes('INNER JOIN users u')) {
+        return {
+          ...defaultResult,
+          all: async () => ({
+            results: groupMembersByGroupID[String(args[0] ?? '')] ?? [],
+          }),
+        }
+      }
+
+      if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+        return {
+          ...defaultResult,
+          first: async () => {
+            const mailbox = normalize(args[0])
+            const userID = directUsersByMailbox[mailbox]
+            return userID ? { id: userID } : null
+          },
+        }
+      }
+
+      return defaultResult
+    },
+  }))
+
+  const batchMock = mock(async (_statements: unknown[]) => [])
+  return {
+    db: {
+      prepare: prepareMock,
+      batch: batchMock,
+    } as unknown as D1Database,
+    prepareMock,
+    batchMock,
+  }
+}
+
+function createExecutionContextHarness() {
+  const pending: Promise<unknown>[] = []
+  const ctx = {
+    waitUntil(promise: Promise<unknown>) {
+      pending.push(promise)
+    },
+  } as unknown as ExecutionContext
+  return {
+    ctx,
+    async flush() {
+      await Promise.all(pending)
+    },
+  }
+}
+
 const SEND_BODY = {
   from: 'me@example.com',
   to: ['you@example.com'],
@@ -604,6 +702,145 @@ describe('worker: POST /api/send', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  test('local direct send emits inbound and outbound realtime dirty events', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      localUsers: ['you@example.com'],
+      directUsersByMailbox: {
+        'me@example.com': 'user-me',
+        'you@example.com': 'user-you',
+      },
+    })
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      OUTBOUND_FROM_EMAIL: 'chat@example.com',
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    })
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify') {
+        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(SEND_BODY),
+    })
+    const harness = createExecutionContextHarness()
+    const response = await worker.fetch(request, env, harness.ctx)
+    await harness.flush()
+
+    expect(response.status).toBe(200)
+    expect(realtimeNotifyBodies).toHaveLength(2)
+    const byTarget = Object.fromEntries(
+      realtimeNotifyBodies.map((body) => [body.target.user_id as string, body]),
+    )
+    expect(byTarget['user-you']).toBeTruthy()
+    expect(byTarget['user-you'].data).toEqual({
+      scope: 'direct',
+      peer: 'me@example.com',
+      direction: 'inbound',
+    })
+    expect(byTarget['user-me']).toBeTruthy()
+    expect(byTarget['user-me'].data).toEqual({
+      scope: 'direct',
+      peer: 'you@example.com',
+      direction: 'outbound',
+    })
+  })
+
+  test('local group send fans out realtime dirty events to active group members', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      localUsers: ['group@example.com'],
+      groupsByMailbox: {
+        'group@example.com': { id: 'group-1', mailbox: 'group@example.com' },
+      },
+      groupMembersByGroupID: {
+        'group-1': [
+          { user_id: 'user-me', member_mailbox: 'me@example.com' },
+          { user_id: 'user-member', member_mailbox: 'member@example.com' },
+        ],
+      },
+    })
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      OUTBOUND_FROM_EMAIL: 'chat@example.com',
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    })
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify') {
+        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...SEND_BODY,
+        to: ['group@example.com'],
+      }),
+    })
+    const harness = createExecutionContextHarness()
+    const response = await worker.fetch(request, env, harness.ctx)
+    await harness.flush()
+
+    expect(response.status).toBe(200)
+    expect(realtimeNotifyBodies).toHaveLength(2)
+    const byTarget = Object.fromEntries(
+      realtimeNotifyBodies.map((body) => [body.target.user_id as string, body]),
+    )
+    expect(byTarget['user-me']).toBeTruthy()
+    expect(byTarget['user-me'].data).toEqual({
+      scope: 'group',
+      peer: 'group@example.com',
+      direction: 'outbound',
+    })
+    expect(byTarget['user-member']).toBeTruthy()
+    expect(byTarget['user-member'].data).toEqual({
+      scope: 'group',
+      peer: 'group@example.com',
+      direction: 'inbound',
+    })
+  })
+
+  test('local direct send skips realtime notify when realtime is not configured', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      localUsers: ['you@example.com'],
+      directUsersByMailbox: {
+        'me@example.com': 'user-me',
+        'you@example.com': 'user-you',
+      },
+    })
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      OUTBOUND_FROM_EMAIL: 'chat@example.com',
+    })
+    globalThis.fetch = mock(async () => {
+      throw new Error('realtime notify should not be called')
+    }) as typeof fetch
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(SEND_BODY),
+    })
+    const response = await worker.fetch(request, env)
+
+    expect(response.status).toBe(200)
+    expect((globalThis.fetch as any).mock.calls).toHaveLength(0)
+  })
+
   test('returns 405 for non-POST methods', async () => {
     const { db } = createMockD1()
     const env = singleMailboxEnv('me@example.com', { DB: db, RESEND_API_KEY: 're_test_key' })
@@ -631,6 +868,140 @@ describe('worker: POST /api/send', () => {
 
     expect(response.status).toBe(403)
     expect(json.error).toBe('Forbidden')
+  })
+})
+
+function makeForwardableEmailMessage(input: {
+  to: string
+  from: string
+  subject: string
+  bodyText: string
+}): ForwardableEmailMessage {
+  const raw = [
+    `From: ${input.from}`,
+    `To: ${input.to}`,
+    `Subject: ${input.subject}`,
+    '',
+    input.bodyText,
+    '',
+  ].join('\r\n')
+  const bytes = new TextEncoder().encode(raw)
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes)
+      controller.close()
+    },
+  })
+  return {
+    from: input.from,
+    to: input.to,
+    headers: new Headers({
+      from: input.from,
+      to: input.to,
+      subject: input.subject,
+    }),
+    raw: stream,
+  } as unknown as ForwardableEmailMessage
+}
+
+describe('worker: inbound email realtime notify', () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  test('direct inbound email emits direct inbound realtime dirty event', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      directUsersByMailbox: {
+        'recipient@example.com': 'user-recipient',
+      },
+    })
+    const env = {
+      DB: db,
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    } as Env
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify') {
+        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Hi',
+      bodyText: 'Hello',
+    })
+    const harness = createExecutionContextHarness()
+    await worker.email(message, env, harness.ctx)
+    await harness.flush()
+
+    expect(realtimeNotifyBodies).toHaveLength(1)
+    expect(realtimeNotifyBodies[0]!.target.user_id).toBe('user-recipient')
+    expect(realtimeNotifyBodies[0]!.data).toEqual({
+      scope: 'direct',
+      peer: 'sender@example.com',
+      direction: 'inbound',
+    })
+  })
+
+  test('group inbound email fans out realtime dirty events to active members', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      groupsByMailbox: {
+        'group@example.com': { id: 'group-1', mailbox: 'group@example.com' },
+      },
+      groupMembersByGroupID: {
+        'group-1': [
+          { user_id: 'user-sender', member_mailbox: 'sender@example.com' },
+          { user_id: 'user-member', member_mailbox: 'member@example.com' },
+        ],
+      },
+    })
+    const env = {
+      DB: db,
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    } as Env
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify') {
+        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'group@example.com',
+      subject: 'Group',
+      bodyText: 'Hello group',
+    })
+    const harness = createExecutionContextHarness()
+    await worker.email(message, env, harness.ctx)
+    await harness.flush()
+
+    expect(realtimeNotifyBodies).toHaveLength(2)
+    const byTarget = Object.fromEntries(
+      realtimeNotifyBodies.map((body) => [body.target.user_id as string, body]),
+    )
+    expect(byTarget['user-sender'].data).toEqual({
+      scope: 'group',
+      peer: 'group@example.com',
+      direction: 'outbound',
+    })
+    expect(byTarget['user-member'].data).toEqual({
+      scope: 'group',
+      peer: 'group@example.com',
+      direction: 'inbound',
+    })
   })
 })
 
