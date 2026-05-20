@@ -150,7 +150,7 @@ function createMockD1() {
 interface RealtimeRoutingFixtures {
   localUsers?: string[]
   directUsersByMailbox?: Record<string, string>
-  groupsByMailbox?: Record<string, { id: string; mailbox: string }>
+  groupsByMailbox?: Record<string, { id: string; mailbox: string; sync_mode?: 'mail' | 'fast_chat' }>
   groupMembersByGroupID?: Record<string, Array<{ user_id: string; member_mailbox: string; display_name?: string | null }>>
   externalMembersByGroupID?: Record<string, Array<{ email: string; display_name?: string | null }>>
 }
@@ -193,7 +193,7 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
           first: async () => {
             const mailbox = normalize(args[0])
             const group = groupsByMailbox[mailbox]
-            return group ? { id: group.id, mailbox: group.mailbox } : null
+            return group ? { id: group.id, mailbox: group.mailbox, sync_mode: group.sync_mode ?? 'mail' } : null
           },
         }
       }
@@ -818,7 +818,7 @@ describe('worker: POST /api/send', () => {
     const { db, chatGroupMessageIndexRows } = createRealtimeRoutingMockD1({
       localUsers: ['group@example.com'],
       groupsByMailbox: {
-        'group@example.com': { id: 'group-1', mailbox: 'group@example.com' },
+        'group@example.com': { id: 'group-1', mailbox: 'group@example.com', sync_mode: 'mail' },
       },
       groupMembersByGroupID: {
         'group-1': [
@@ -1031,7 +1031,7 @@ describe('worker: inbound email realtime notify', () => {
   test('group inbound email fans out realtime dirty events to active members', async () => {
     const { db, chatGroupMessageIndexRows } = createRealtimeRoutingMockD1({
       groupsByMailbox: {
-        'group@example.com': { id: 'group-1', mailbox: 'group@example.com' },
+        'group@example.com': { id: 'group-1', mailbox: 'group@example.com', sync_mode: 'mail' },
       },
       groupMembersByGroupID: {
         'group-1': [
@@ -1091,6 +1091,40 @@ describe('worker: inbound email realtime notify', () => {
       text: 'Hello group',
       provider: null,
     })
+  })
+
+  test('fast_chat group inbound email is ignored', async () => {
+    const { db, chatGroupMessageIndexRows } = createRealtimeRoutingMockD1({
+      groupsByMailbox: {
+        'group@example.com': { id: 'group-1', mailbox: 'group@example.com', sync_mode: 'fast_chat' },
+      },
+      groupMembersByGroupID: {
+        'group-1': [
+          { user_id: 'user-member', member_mailbox: 'member@example.com', display_name: 'Member' },
+        ],
+      },
+    })
+    const env = {
+      DB: db,
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    } as Env
+    globalThis.fetch = mock(async () => {
+      throw new Error('fast_chat group inbound email should not trigger realtime notify')
+    }) as typeof fetch
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'group@example.com',
+      subject: 'Group',
+      bodyText: 'Hello fast group',
+    })
+    const harness = createExecutionContextHarness()
+    await worker.email(message, env, harness.ctx)
+    await harness.flush()
+
+    expect(chatGroupMessageIndexRows).toHaveLength(0)
+    expect((globalThis.fetch as any).mock.calls).toHaveLength(0)
   })
 })
 

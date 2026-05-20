@@ -148,6 +148,16 @@ export default {
     const from = message.from
     const mailbox = normalizeMailbox(to)
     const fromAddress = normalizeMailbox(message.headers.get('from') ?? from)
+    const group = await getActiveChatGroupByMailbox(env, mailbox)
+    if (group?.sync_mode === 'fast_chat') {
+      console.warn(JSON.stringify({
+        event: 'fast_chat_group_email_ignored',
+        source: 'mails-worker',
+        mailbox,
+        from: fromAddress,
+      }))
+      return
+    }
     const id = crypto.randomUUID()
     const now = new Date().toISOString()
     const parsed = await parseIncomingEmail(await new Response(message.raw).arrayBuffer(), id, now)
@@ -1312,18 +1322,19 @@ async function isDirectConversationRecipientMailbox(env: Env, mailbox: string): 
 async function getActiveChatGroupByMailbox(
   env: Env,
   mailbox: string,
-): Promise<{ id: string; mailbox: string } | null> {
+): Promise<{ id: string; mailbox: string; sync_mode: 'mail' | 'fast_chat' } | null> {
   try {
     const group = await env.DB.prepare(`
-      SELECT id, mailbox
+      SELECT id, mailbox, sync_mode
       FROM chat_groups
       WHERE mailbox = ? AND status = 'active'
       LIMIT 1
-    `).bind(normalizeMailbox(mailbox)).first<{ id: string; mailbox: string }>()
+    `).bind(normalizeMailbox(mailbox)).first<{ id: string; mailbox: string; sync_mode: 'mail' | 'fast_chat' }>()
     if (!group) return null
     return {
       id: group.id,
       mailbox: normalizeMailbox(group.mailbox),
+      sync_mode: group.sync_mode,
     }
   } catch (error) {
     console.warn(JSON.stringify({
