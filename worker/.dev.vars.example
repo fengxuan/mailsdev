@@ -2,3 +2,5 @@ MAILBOX=agent@example.com
 AUTH_TOKEN=replace_me_for_agent_example_com
 # AUTH_TOKENS_JSON={"agent@example.com":"token_for_agent","other@example.com":"token_for_other"}
 RESEND_API_KEY=re_optional_if_you_want_send_api
+REALTIME_NOTIFY_BASE_URL=https://mails-realtime-notify.example.com
+REALTIME_INTERNAL_TOKEN=replace_me_for_realtime_notify

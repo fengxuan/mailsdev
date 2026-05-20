@@ -35,6 +35,10 @@ export interface Env {
   AWS_SES_ENDPOINT?: string
   /** Cloudflare Email Service binding (private beta). */
   EMAIL?: CloudflareEmailBinding
+  /** Base URL for the realtime notify Worker, e.g. https://mails-realtime-notify.example.com */
+  REALTIME_NOTIFY_BASE_URL?: string
+  /** Internal bearer token required by the realtime notify Worker. */
+  REALTIME_INTERNAL_TOKEN?: string
   /**
    * Ordered provider preference list, e.g. "cloudflare,resend,ses".
    * Defaults to "cloudflare,resend,ses"; providers lacking configuration are
@@ -62,7 +66,7 @@ interface ConversationSummaryRow {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
@@ -101,7 +105,7 @@ export default {
             if (request.method !== 'POST') {
               response = Response.json({ error: 'Method not allowed' }, { status: 405 })
             } else {
-              response = await handleSend(request, env, auth.mailbox)
+              response = await handleSend(request, env, auth.mailbox, ctx)
             }
             break
           case '/api/sync':
@@ -122,7 +126,7 @@ export default {
     return response
   },
 
-  async email(message: ForwardableEmailMessage, env: Env): Promise<void> {
+  async email(message: ForwardableEmailMessage, env: Env, ctx?: ExecutionContext): Promise<void> {
     const to = message.to
     const from = message.from
     const mailbox = normalizeMailbox(to)
@@ -194,6 +198,7 @@ export default {
     ]
 
     await env.DB.batch(statements)
+    scheduleRealtimeNotifyForMailbox(env, ctx, mailbox, 'email_inbound')
   },
 } satisfies ExportedHandler<Env>
 
@@ -449,7 +454,12 @@ async function handleGetEmail(url: URL, env: Env, authorizedMailbox: string): Pr
   )
 }
 
-async function handleSend(request: Request, env: Env, authorizedMailbox: string): Promise<Response> {
+async function handleSend(
+  request: Request,
+  env: Env,
+  authorizedMailbox: string,
+  ctx?: ExecutionContext,
+): Promise<Response> {
   const body = await request.json() as {
     from?: string
     to?: string[]
@@ -489,6 +499,8 @@ async function handleSend(request: Request, env: Env, authorizedMailbox: string)
 
   const localRecipients = await resolveLocalRecipients(env, body.to)
   if (localRecipients) {
+    const normalizedAuthorizedMailbox = normalizeMailbox(authorizedMailbox)
+    const localInboundRecipients = localRecipients.filter((recipient) => recipient !== normalizedAuthorizedMailbox)
     const messageId = crypto.randomUUID()
     await persistOutboundEmail(env, {
       id: messageId,
@@ -504,15 +516,18 @@ async function handleSend(request: Request, env: Env, authorizedMailbox: string)
       receivedAt: new Date().toISOString(),
     })
 
-    await persistLocalInboundEmails(env, {
-      recipients: localRecipients,
-      fromAddress: senderMailbox,
-      fromName: parseFromName(body.from),
-      subject: body.subject,
-      bodyText: body.text,
-      bodyHtml: body.html,
-      replyTo: body.reply_to,
-    })
+    if (localInboundRecipients.length > 0) {
+      await persistLocalInboundEmails(env, {
+        recipients: localInboundRecipients,
+        fromAddress: senderMailbox,
+        fromName: parseFromName(body.from),
+        subject: body.subject,
+        bodyText: body.text,
+        bodyHtml: body.html,
+        replyTo: body.reply_to,
+      })
+      scheduleRealtimeNotifyForMailboxes(env, ctx, localInboundRecipients, 'local_inbound')
+    }
 
     return Response.json({ id: messageId, from: body.from, provider: 'local' })
   }
@@ -872,6 +887,132 @@ function safeJsonParse<T>(value: string | null | undefined, fallback: T): T {
   } catch {
     return fallback
   }
+}
+
+function scheduleRealtimeNotifyForMailboxes(
+  env: Env,
+  ctx: ExecutionContext | undefined,
+  mailboxes: string[],
+  source: string,
+): void {
+  const uniqueMailboxes = [...new Set(mailboxes.map(normalizeMailbox))]
+  for (const mailbox of uniqueMailboxes) {
+    scheduleRealtimeNotifyForMailbox(env, ctx, mailbox, source)
+  }
+}
+
+function scheduleRealtimeNotifyForMailbox(
+  env: Env,
+  ctx: ExecutionContext | undefined,
+  mailbox: string,
+  source: string,
+): void {
+  if (!env.REALTIME_NOTIFY_BASE_URL?.trim() || !env.REALTIME_INTERNAL_TOKEN?.trim()) {
+    return
+  }
+
+  runBackground(ctx, (async () => {
+    try {
+      const userId = await findActiveDirectUserIdByMailbox(env, mailbox)
+      if (!userId) {
+        return
+      }
+
+      const event = {
+        v: 1 as const,
+        type: 'conversations_dirty' as const,
+        event_id: crypto.randomUUID(),
+        emitted_at: new Date().toISOString(),
+        target: {
+          user_id: userId,
+        },
+        data: {
+          scope: 'direct' as const,
+        },
+      }
+
+      const response = await fetch(new URL('/internal/notify', env.REALTIME_NOTIFY_BASE_URL), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${env.REALTIME_INTERNAL_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(event),
+      })
+
+      if (!response.ok) {
+        console.warn(JSON.stringify({
+          event: 'realtime_notify_failed',
+          source: 'mails-worker',
+          trigger_source: source,
+          event_id: event.event_id,
+          type: event.type,
+          target_user_id: userId,
+          mailbox,
+          status: response.status,
+        }))
+        return
+      }
+
+      console.log(JSON.stringify({
+        event: 'realtime_notify_sent',
+        source: 'mails-worker',
+        trigger_source: source,
+        event_id: event.event_id,
+        type: event.type,
+        target_user_id: userId,
+        mailbox,
+      }))
+    } catch (error) {
+      console.warn(JSON.stringify({
+        event: 'realtime_notify_failed',
+        source: 'mails-worker',
+        trigger_source: source,
+        mailbox,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    }
+  })())
+}
+
+async function findActiveDirectUserIdByMailbox(env: Env, mailbox: string): Promise<string | null> {
+  try {
+    const row = await env.DB.prepare(`
+      SELECT u.id
+      FROM users u
+      LEFT JOIN chat_groups g
+        ON g.service_user_id = u.id
+       AND g.status = 'active'
+      WHERE u.mailbox = ?
+        AND u.status = 'active'
+        AND g.id IS NULL
+      LIMIT 1
+    `).bind(normalizeMailbox(mailbox)).first<{ id: string }>()
+    return row?.id ?? null
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: 'realtime_notify_lookup_failed',
+      source: 'mails-worker',
+      mailbox,
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    return null
+  }
+}
+
+function runBackground(ctx: ExecutionContext | undefined, task: Promise<void>): void {
+  if (ctx) {
+    ctx.waitUntil(task)
+    return
+  }
+
+  void task.catch((error) => {
+    console.warn(JSON.stringify({
+      event: 'background_task_failed',
+      source: 'mails-worker',
+      error: error instanceof Error ? error.message : String(error),
+    }))
+  })
 }
 
 function extractBearerToken(request: Request): string | null {

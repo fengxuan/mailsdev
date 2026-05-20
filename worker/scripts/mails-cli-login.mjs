@@ -6,8 +6,8 @@ import { dirname, join } from 'node:path'
 import readline from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
 
-const DEFAULT_API_BASE_URL = 'https://mails-chat-api.lineme.workers.dev'
-const DEFAULT_WORKER_URL = 'https://mails-worker.lineme.workers.dev'
+const DEFAULT_API_BASE_URL = 'https://mails-chat-api.canyin.uk'
+const DEFAULT_WORKER_URL = 'https://mails-worker.canyin.uk'
 const CONFIG_DIR = join(homedir(), '.mails')
 const CONFIG_PATH = join(CONFIG_DIR, 'config.json')
 
