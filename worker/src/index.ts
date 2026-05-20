@@ -77,6 +77,11 @@ interface RealtimeNotifyEvent {
   direction: RealtimeNotifyDirection
 }
 
+interface PersistedInboundEmailRef {
+  id: string
+  mailbox: string
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
@@ -210,6 +215,16 @@ export default {
     ]
 
     await env.DB.batch(statements)
+    await maybeUpsertChatGroupMessageIndex(env, {
+      emailId: id,
+      mailbox,
+      senderMailbox: fromAddress,
+      senderName: fromName,
+      bodyText: parsed.bodyText,
+      bodyHtml: parsed.bodyHtml,
+      provider: null,
+      receivedAt: now,
+    })
     scheduleRealtimeNotifyForIncomingMailbox(env, ctx, {
       mailbox,
       senderMailbox: fromAddress,
@@ -534,7 +549,7 @@ async function handleSend(
     })
 
     if (localInboundRecipients.length > 0) {
-      await persistLocalInboundEmails(env, {
+      const persistedInboundEmails = await persistLocalInboundEmails(env, {
         recipients: localInboundRecipients,
         fromAddress: senderMailbox,
         fromName: parseFromName(body.from),
@@ -543,6 +558,18 @@ async function handleSend(
         bodyHtml: body.html,
         replyTo: body.reply_to,
       })
+      for (const email of persistedInboundEmails) {
+        await maybeUpsertChatGroupMessageIndex(env, {
+          emailId: email.id,
+          mailbox: email.mailbox,
+          senderMailbox,
+          senderName: parseFromName(body.from),
+          bodyText: body.text,
+          bodyHtml: body.html,
+          provider: 'local',
+          receivedAt: new Date().toISOString(),
+        })
+      }
       scheduleRealtimeNotifyForIncomingMailboxes(env, ctx, {
         mailboxes: localInboundRecipients,
         senderMailbox,
@@ -647,11 +674,14 @@ async function persistLocalInboundEmails(
     bodyHtml?: string
     replyTo?: string
   },
-): Promise<void> {
+): Promise<PersistedInboundEmailRef[]> {
   const now = new Date().toISOString()
-  const statements = input.recipients.map((recipient) => {
-    const id = crypto.randomUUID()
-    return env.DB.prepare(`
+  const persistedEmails = input.recipients.map((recipient) => ({
+    id: crypto.randomUUID(),
+    mailbox: recipient,
+  }))
+  const statements = persistedEmails.map((email) =>
+    env.DB.prepare(`
       INSERT INTO emails (
         id, mailbox, from_address, from_name, to_address, peer_address, subject,
         body_text, body_html, code, headers, metadata, message_id,
@@ -659,11 +689,11 @@ async function persistLocalInboundEmails(
         raw_storage_key, direction, status, provider, received_at, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, '{}', NULL, 0, 0, '', '', NULL, 'inbound', 'received', 'local', ?, ?)
     `).bind(
-      id,
-      recipient,
+      email.id,
+      email.mailbox,
       input.fromAddress,
       input.fromName,
-      recipient,
+      email.mailbox,
       input.fromAddress,
       input.subject,
       (input.bodyText ?? '').slice(0, 50000),
@@ -672,9 +702,10 @@ async function persistLocalInboundEmails(
       now,
       now,
     )
-  })
+  )
 
   await env.DB.batch(statements)
+  return persistedEmails
 }
 
 async function persistOutboundEmail(
@@ -728,6 +759,108 @@ function buildLocalHeaders(fromAddress: string, replyTo?: string): Record<string
   }
 
   return headers
+}
+
+async function maybeUpsertChatGroupMessageIndex(
+  env: Env,
+  input: {
+    emailId: string
+    mailbox: string
+    senderMailbox: string
+    senderName: string
+    bodyText?: string
+    bodyHtml?: string
+    provider: string | null
+    receivedAt: string
+  },
+): Promise<void> {
+  const group = await getActiveChatGroupByMailbox(env, input.mailbox)
+  if (!group) return
+
+  const normalizedSenderMailbox = normalizeMailbox(input.senderMailbox)
+  const member = await getActiveChatGroupMemberForIndex(env, group.id, normalizedSenderMailbox)
+  if (member) {
+    await upsertChatGroupMessageIndex(env, {
+      groupId: group.id,
+      groupMailbox: group.mailbox,
+      emailId: input.emailId,
+      senderEmail: member.member_mailbox,
+      senderName: nonEmptyTrimmed(member.display_name) ?? nonEmptyTrimmed(input.senderName),
+      senderSource: 'internal',
+      text: indexedChatMessageText(input.bodyText, input.bodyHtml),
+      provider: input.provider,
+      receivedAt: input.receivedAt,
+    })
+    return
+  }
+
+  const externalMember = await getActiveChatGroupExternalMemberForIndex(env, group.id, normalizedSenderMailbox)
+  if (!externalMember) return
+
+  await upsertChatGroupMessageIndex(env, {
+    groupId: group.id,
+    groupMailbox: group.mailbox,
+    emailId: input.emailId,
+    senderEmail: externalMember.email,
+    senderName: nonEmptyTrimmed(externalMember.display_name) ?? nonEmptyTrimmed(input.senderName),
+    senderSource: 'external',
+    text: indexedChatMessageText(input.bodyText, input.bodyHtml),
+    provider: input.provider,
+    receivedAt: input.receivedAt,
+  })
+}
+
+function indexedChatMessageText(bodyText?: string, bodyHtml?: string): string {
+  const text = nonEmptyTrimmed(bodyText) ?? nonEmptyTrimmed(bodyHtml) ?? ''
+  return text.slice(0, 50000)
+}
+
+function nonEmptyTrimmed(value: string | null | undefined): string | null {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : null
+}
+
+async function upsertChatGroupMessageIndex(
+  env: Env,
+  input: {
+    groupId: string
+    groupMailbox: string
+    emailId: string
+    senderEmail: string
+    senderName: string | null
+    senderSource: 'internal' | 'external'
+    text: string
+    provider: string | null
+    receivedAt: string
+  },
+): Promise<void> {
+  const nowIso = new Date().toISOString()
+  await env.DB.prepare(`
+    INSERT INTO chat_group_message_index (
+      id, group_id, group_mailbox, email_id, sender_email, sender_name,
+      sender_source, text, provider, received_at, created_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(group_id, email_id) DO UPDATE SET
+      sender_email = excluded.sender_email,
+      sender_name = excluded.sender_name,
+      sender_source = excluded.sender_source,
+      text = excluded.text,
+      provider = excluded.provider,
+      received_at = excluded.received_at
+  `).bind(
+    crypto.randomUUID(),
+    input.groupId,
+    input.groupMailbox,
+    input.emailId,
+    input.senderEmail,
+    input.senderName,
+    input.senderSource,
+    input.text,
+    input.provider,
+    input.receivedAt,
+    nowIso,
+  ).run()
 }
 
 function getLocalDomain(env: Env): string | null {
@@ -1182,6 +1315,70 @@ async function listActiveChatGroupRealtimeMembers(
       error: error instanceof Error ? error.message : String(error),
     }))
     return []
+  }
+}
+
+async function getActiveChatGroupMemberForIndex(
+  env: Env,
+  groupId: string,
+  mailbox: string,
+): Promise<{ member_mailbox: string; display_name: string | null } | null> {
+  try {
+    const row = await env.DB.prepare(`
+      SELECT m.member_mailbox, u.display_name
+      FROM chat_group_members m
+      INNER JOIN users u ON u.id = m.user_id
+      WHERE m.group_id = ?
+        AND m.member_mailbox = ?
+        AND m.status = 'active'
+        AND u.status = 'active'
+      LIMIT 1
+    `).bind(groupId, normalizeMailbox(mailbox)).first<{ member_mailbox: string; display_name: string | null }>()
+    if (!row) return null
+    return {
+      member_mailbox: normalizeMailbox(row.member_mailbox),
+      display_name: row.display_name ?? null,
+    }
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: 'chat_group_index_lookup_failed',
+      source: 'mails-worker',
+      group_id: groupId,
+      mailbox: normalizeMailbox(mailbox),
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    return null
+  }
+}
+
+async function getActiveChatGroupExternalMemberForIndex(
+  env: Env,
+  groupId: string,
+  email: string,
+): Promise<{ email: string; display_name: string | null } | null> {
+  try {
+    const row = await env.DB.prepare(`
+      SELECT email, display_name
+      FROM chat_group_external_members
+      WHERE group_id = ?
+        AND email = ?
+        AND status = 'active'
+      LIMIT 1
+    `).bind(groupId, normalizeMailbox(email)).first<{ email: string; display_name: string | null }>()
+    if (!row) return null
+    return {
+      email: normalizeMailbox(row.email),
+      display_name: row.display_name ?? null,
+    }
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: 'chat_group_index_lookup_failed',
+      source: 'mails-worker',
+      group_id: groupId,
+      mailbox: normalizeMailbox(email),
+      error: error instanceof Error ? error.message : String(error),
+    }))
+    return null
   }
 }
 

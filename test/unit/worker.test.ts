@@ -151,7 +151,8 @@ interface RealtimeRoutingFixtures {
   localUsers?: string[]
   directUsersByMailbox?: Record<string, string>
   groupsByMailbox?: Record<string, { id: string; mailbox: string }>
-  groupMembersByGroupID?: Record<string, Array<{ user_id: string; member_mailbox: string }>>
+  groupMembersByGroupID?: Record<string, Array<{ user_id: string; member_mailbox: string; display_name?: string | null }>>
+  externalMembersByGroupID?: Record<string, Array<{ email: string; display_name?: string | null }>>
 }
 
 function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
@@ -164,6 +165,8 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
     Object.entries(fixtures.groupsByMailbox ?? {}).map(([mailbox, group]) => [normalize(mailbox), group]),
   )
   const groupMembersByGroupID = fixtures.groupMembersByGroupID ?? {}
+  const externalMembersByGroupID = fixtures.externalMembersByGroupID ?? {}
+  const chatGroupMessageIndexRows: Array<Record<string, unknown>> = []
   const defaultResult = {
     run: async () => ({ success: true }),
     all: async () => ({ results: [] as Array<Record<string, unknown>> }),
@@ -196,11 +199,40 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
       }
 
       if (sql.includes('FROM chat_group_members m') && sql.includes('INNER JOIN users u')) {
+        if (sql.includes('WHERE m.group_id = ?') && sql.includes('m.member_mailbox = ?')) {
+          return {
+            ...defaultResult,
+            first: async () => {
+              const groupID = String(args[0] ?? '')
+              const mailbox = normalize(args[1])
+              const member = (groupMembersByGroupID[groupID] ?? []).find((item) => normalize(item.member_mailbox) == mailbox)
+              return member ? {
+                member_mailbox: member.member_mailbox,
+                display_name: member.display_name ?? null,
+              } : null
+            },
+          }
+        }
         return {
           ...defaultResult,
           all: async () => ({
             results: groupMembersByGroupID[String(args[0] ?? '')] ?? [],
           }),
+        }
+      }
+
+      if (sql.includes('FROM chat_group_external_members')) {
+        return {
+          ...defaultResult,
+          first: async () => {
+            const groupID = String(args[0] ?? '')
+            const email = normalize(args[1])
+            const member = (externalMembersByGroupID[groupID] ?? []).find((item) => normalize(item.email) == email)
+            return member ? {
+              email: member.email,
+              display_name: member.display_name ?? null,
+            } : null
+          },
         }
       }
 
@@ -211,6 +243,28 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
             const mailbox = normalize(args[0])
             const userID = directUsersByMailbox[mailbox]
             return userID ? { id: userID } : null
+          },
+        }
+      }
+
+      if (sql.includes('INSERT INTO chat_group_message_index')) {
+        return {
+          ...defaultResult,
+          run: async () => {
+            chatGroupMessageIndexRows.push({
+              id: String(args[0] ?? ''),
+              group_id: String(args[1] ?? ''),
+              group_mailbox: String(args[2] ?? ''),
+              email_id: String(args[3] ?? ''),
+              sender_email: String(args[4] ?? ''),
+              sender_name: args[5] === null ? null : String(args[5] ?? ''),
+              sender_source: String(args[6] ?? ''),
+              text: String(args[7] ?? ''),
+              provider: args[8] === null ? null : String(args[8] ?? ''),
+              received_at: String(args[9] ?? ''),
+              created_at: String(args[10] ?? ''),
+            })
+            return { success: true }
           },
         }
       }
@@ -227,6 +281,7 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
     } as unknown as D1Database,
     prepareMock,
     batchMock,
+    chatGroupMessageIndexRows,
   }
 }
 
@@ -755,15 +810,15 @@ describe('worker: POST /api/send', () => {
   })
 
   test('local group send fans out realtime dirty events to active group members', async () => {
-    const { db } = createRealtimeRoutingMockD1({
+    const { db, chatGroupMessageIndexRows } = createRealtimeRoutingMockD1({
       localUsers: ['group@example.com'],
       groupsByMailbox: {
         'group@example.com': { id: 'group-1', mailbox: 'group@example.com' },
       },
       groupMembersByGroupID: {
         'group-1': [
-          { user_id: 'user-me', member_mailbox: 'me@example.com' },
-          { user_id: 'user-member', member_mailbox: 'member@example.com' },
+          { user_id: 'user-me', member_mailbox: 'me@example.com', display_name: 'Me' },
+          { user_id: 'user-member', member_mailbox: 'member@example.com', display_name: 'Member' },
         ],
       },
     })
@@ -811,6 +866,17 @@ describe('worker: POST /api/send', () => {
       scope: 'group',
       peer: 'group@example.com',
       direction: 'inbound',
+    })
+    expect(chatGroupMessageIndexRows).toHaveLength(1)
+    expect(chatGroupMessageIndexRows[0]).toMatchObject({
+      group_id: 'group-1',
+      group_mailbox: 'group@example.com',
+      email_id: expect.any(String),
+      sender_email: 'me@example.com',
+      sender_name: 'Me',
+      sender_source: 'internal',
+      text: 'World',
+      provider: 'local',
     })
   })
 
@@ -952,14 +1018,14 @@ describe('worker: inbound email realtime notify', () => {
   })
 
   test('group inbound email fans out realtime dirty events to active members', async () => {
-    const { db } = createRealtimeRoutingMockD1({
+    const { db, chatGroupMessageIndexRows } = createRealtimeRoutingMockD1({
       groupsByMailbox: {
         'group@example.com': { id: 'group-1', mailbox: 'group@example.com' },
       },
       groupMembersByGroupID: {
         'group-1': [
-          { user_id: 'user-sender', member_mailbox: 'sender@example.com' },
-          { user_id: 'user-member', member_mailbox: 'member@example.com' },
+          { user_id: 'user-sender', member_mailbox: 'sender@example.com', display_name: 'Sender' },
+          { user_id: 'user-member', member_mailbox: 'member@example.com', display_name: 'Member' },
         ],
       },
     })
@@ -1001,6 +1067,17 @@ describe('worker: inbound email realtime notify', () => {
       scope: 'group',
       peer: 'group@example.com',
       direction: 'inbound',
+    })
+    expect(chatGroupMessageIndexRows).toHaveLength(1)
+    expect(chatGroupMessageIndexRows[0]).toMatchObject({
+      group_id: 'group-1',
+      group_mailbox: 'group@example.com',
+      email_id: expect.any(String),
+      sender_email: 'sender@example.com',
+      sender_name: 'Sender',
+      sender_source: 'internal',
+      text: 'Hello group',
+      provider: null,
     })
   })
 })
