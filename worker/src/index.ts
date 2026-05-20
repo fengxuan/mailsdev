@@ -1101,9 +1101,7 @@ function scheduleRealtimeNotifyForIncomingMailbox(
         senderMailbox: input.senderMailbox,
         source: input.source,
       })
-      for (const event of events) {
-        await sendRealtimeNotifyEvent(env, event)
-      }
+      await sendRealtimeNotifyEvents(env, events)
     } catch (error) {
       console.warn(JSON.stringify({
         event: 'realtime_notify_failed',
@@ -1145,6 +1143,89 @@ function scheduleRealtimeNotifyForDirectOutboundSender(
 }
 
 async function sendRealtimeNotifyEvent(env: Env, event: RealtimeNotifyEvent): Promise<void> {
+  const result = await sendRealtimeNotifyEvents(env, [event])
+  if (!result.ok) {
+    console.warn(JSON.stringify({
+      event: 'realtime_notify_failed',
+      source: 'mails-worker',
+      trigger_source: event.source,
+      target_user_id: event.targetUserId,
+      mailbox: event.mailbox,
+      scope: event.scope,
+      peer: event.peer,
+      direction: event.direction,
+      status: result.status,
+    }))
+    return
+  }
+}
+
+async function sendRealtimeNotifyEvents(
+  env: Env,
+  events: RealtimeNotifyEvent[],
+): Promise<{ ok: boolean; status: number }> {
+  if (events.length === 0) {
+    return { ok: true, status: 200 }
+  }
+
+  if (events.length === 1) {
+    const event = events[0]!
+    const envelope = buildRealtimeNotifyEnvelope(event)
+    const response = await fetch(new URL('/internal/notify', env.REALTIME_NOTIFY_BASE_URL), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.REALTIME_INTERNAL_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(envelope),
+    })
+
+    if (!response.ok) {
+      return { ok: false, status: response.status }
+    }
+
+    console.log(JSON.stringify({
+      event: 'realtime_notify_sent',
+      source: 'mails-worker',
+      trigger_source: event.source,
+      event_id: envelope.event_id,
+      type: envelope.type,
+      target_user_id: event.targetUserId,
+      mailbox: event.mailbox,
+      scope: event.scope,
+      peer: event.peer,
+      direction: event.direction,
+    }))
+    return { ok: true, status: response.status }
+  }
+
+  const envelopes = events.map(buildRealtimeNotifyEnvelope)
+  const response = await fetch(new URL('/internal/notify-batch', env.REALTIME_NOTIFY_BASE_URL), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${env.REALTIME_INTERNAL_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ events: envelopes }),
+  })
+
+  if (!response.ok) {
+    return { ok: false, status: response.status }
+  }
+
+  console.log(JSON.stringify({
+    event: 'realtime_notify_batch_sent',
+    source: 'mails-worker',
+    trigger_source: events[0]!.source,
+    event_count: envelopes.length,
+    mailbox: events[0]!.mailbox,
+    scope: events[0]!.scope,
+    peer: events[0]!.peer,
+  }))
+  return { ok: true, status: response.status }
+}
+
+function buildRealtimeNotifyEnvelope(event: RealtimeNotifyEvent) {
   const envelope = {
     v: 1 as const,
     type: 'conversations_dirty' as const,
@@ -1159,45 +1240,7 @@ async function sendRealtimeNotifyEvent(env: Env, event: RealtimeNotifyEvent): Pr
       direction: event.direction,
     },
   }
-
-  const response = await fetch(new URL('/internal/notify', env.REALTIME_NOTIFY_BASE_URL), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.REALTIME_INTERNAL_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(envelope),
-  })
-
-  if (!response.ok) {
-    console.warn(JSON.stringify({
-      event: 'realtime_notify_failed',
-      source: 'mails-worker',
-      trigger_source: event.source,
-      event_id: envelope.event_id,
-      type: envelope.type,
-      target_user_id: event.targetUserId,
-      mailbox: event.mailbox,
-      scope: event.scope,
-      peer: event.peer,
-      direction: event.direction,
-      status: response.status,
-    }))
-    return
-  }
-
-  console.log(JSON.stringify({
-    event: 'realtime_notify_sent',
-    source: 'mails-worker',
-    trigger_source: event.source,
-    event_id: envelope.event_id,
-    type: envelope.type,
-    target_user_id: event.targetUserId,
-    mailbox: event.mailbox,
-    scope: event.scope,
-    peer: event.peer,
-    direction: event.direction,
-  }))
+  return envelope
 }
 
 async function resolveRealtimeEventsForIncomingMailbox(

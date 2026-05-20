@@ -778,6 +778,11 @@ describe('worker: POST /api/send', () => {
         realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
         return new Response(JSON.stringify({ ok: true }), { status: 200 })
       }
+      if (url === 'https://realtime.example.com/internal/notify-batch') {
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        realtimeNotifyBodies.push(...(body.events ?? []))
+        return new Response(JSON.stringify({ ok: true, count: (body.events ?? []).length }), { status: 200 })
+      }
       throw new Error(`unexpected fetch url ${url}`)
     }) as typeof fetch
 
@@ -831,9 +836,10 @@ describe('worker: POST /api/send', () => {
     const realtimeNotifyBodies: Array<Record<string, any>> = []
     globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url === 'https://realtime.example.com/internal/notify') {
-        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
-        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      if (url === 'https://realtime.example.com/internal/notify-batch') {
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        realtimeNotifyBodies.push(...(body.events ?? []))
+        return new Response(JSON.stringify({ ok: true, count: (body.events ?? []).length }), { status: 200 })
       }
       throw new Error(`unexpected fetch url ${url}`)
     }) as typeof fetch
@@ -995,6 +1001,11 @@ describe('worker: inbound email realtime notify', () => {
         realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
         return new Response(JSON.stringify({ ok: true }), { status: 200 })
       }
+      if (url === 'https://realtime.example.com/internal/notify-batch') {
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        realtimeNotifyBodies.push(...(body.events ?? []))
+        return new Response(JSON.stringify({ ok: true, count: (body.events ?? []).length }), { status: 200 })
+      }
       throw new Error(`unexpected fetch url ${url}`)
     }) as typeof fetch
 
@@ -1037,9 +1048,10 @@ describe('worker: inbound email realtime notify', () => {
     const realtimeNotifyBodies: Array<Record<string, any>> = []
     globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url === 'https://realtime.example.com/internal/notify') {
-        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
-        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      if (url === 'https://realtime.example.com/internal/notify-batch') {
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        realtimeNotifyBodies.push(...(body.events ?? []))
+        return new Response(JSON.stringify({ ok: true, count: (body.events ?? []).length }), { status: 200 })
       }
       throw new Error(`unexpected fetch url ${url}`)
     }) as typeof fetch
