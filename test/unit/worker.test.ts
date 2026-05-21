@@ -797,8 +797,9 @@ describe('worker: POST /api/send', () => {
 
     expect(response.status).toBe(200)
     expect(realtimeNotifyBodies).toHaveLength(2)
+    const dirtyEvents = realtimeNotifyBodies.filter((body) => body.type === 'conversations_dirty')
     const byTarget = Object.fromEntries(
-      realtimeNotifyBodies.map((body) => [body.target.user_id as string, body]),
+      dirtyEvents.map((body) => [body.target.user_id as string, body]),
     )
     expect(byTarget['user-you']).toBeTruthy()
     expect(byTarget['user-you'].data).toEqual({
@@ -858,8 +859,9 @@ describe('worker: POST /api/send', () => {
 
     expect(response.status).toBe(200)
     expect(realtimeNotifyBodies).toHaveLength(2)
+    const dirtyEvents = realtimeNotifyBodies.filter((body) => body.type === 'conversations_dirty')
     const byTarget = Object.fromEntries(
-      realtimeNotifyBodies.map((body) => [body.target.user_id as string, body]),
+      dirtyEvents.map((body) => [body.target.user_id as string, body]),
     )
     expect(byTarget['user-me']).toBeTruthy()
     expect(byTarget['user-me'].data).toEqual({
@@ -1067,8 +1069,9 @@ describe('worker: inbound email realtime notify', () => {
     await harness.flush()
 
     expect(realtimeNotifyBodies).toHaveLength(2)
+    const dirtyEvents = realtimeNotifyBodies.filter((body) => body.type === 'conversations_dirty')
     const byTarget = Object.fromEntries(
-      realtimeNotifyBodies.map((body) => [body.target.user_id as string, body]),
+      dirtyEvents.map((body) => [body.target.user_id as string, body]),
     )
     expect(byTarget['user-sender'].data).toEqual({
       scope: 'group',

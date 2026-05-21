@@ -67,6 +67,38 @@ interface ConversationSummaryRow {
 
 type RealtimeNotifyScope = 'direct' | 'group'
 type RealtimeNotifyDirection = 'inbound' | 'outbound'
+type RealtimeConversationType = 'direct' | 'group'
+type RealtimeSyncMode = 'mail' | 'fast_chat'
+
+interface RealtimeConversationPayload {
+  peer: string
+  conversation_type: RealtimeConversationType
+  group_mailbox: string | null
+  sync_mode: RealtimeSyncMode
+  title: string
+  peer_display_name: string | null
+  peer_alias: string | null
+  last_message: string
+  last_direction: RealtimeNotifyDirection
+  last_at: string
+  last_sender_email: string | null
+  last_sender_name: string | null
+  unread_count: number
+}
+
+interface RealtimeMessagePayload {
+  id: string
+  peer: string
+  conversation_type: RealtimeConversationType
+  group_mailbox: string | null
+  sync_mode: RealtimeSyncMode
+  direction: RealtimeNotifyDirection
+  text: string
+  sent_at: string
+  status: 'received' | 'sent' | 'failed'
+  sender_email: string | null
+  sender_name: string | null
+}
 
 interface RealtimeNotifyEvent {
   targetUserId: string
@@ -75,6 +107,11 @@ interface RealtimeNotifyEvent {
   scope: RealtimeNotifyScope
   peer: string
   direction: RealtimeNotifyDirection
+  conversationType?: RealtimeConversationType
+  syncMode?: RealtimeSyncMode
+  groupMailbox?: string | null
+  conversation?: RealtimeConversationPayload
+  message?: RealtimeMessagePayload
 }
 
 interface PersistedInboundEmailRef {
@@ -1236,6 +1273,29 @@ async function sendRealtimeNotifyEvents(
 }
 
 function buildRealtimeNotifyEnvelope(event: RealtimeNotifyEvent) {
+  if (event.conversation) {
+    return {
+      v: 1 as const,
+      type: 'conversation_updated' as const,
+      event_id: crypto.randomUUID(),
+      emitted_at: new Date().toISOString(),
+      target: {
+        user_id: event.targetUserId,
+      },
+      data: {
+        peer: event.peer,
+        conversation_type: event.conversationType ?? 'direct',
+        group_mailbox: event.groupMailbox ?? null,
+        sync_mode: event.syncMode ?? 'mail',
+        conversation: event.conversation,
+        ...(event.message ? { message: event.message } : {}),
+        refresh_hint: {
+          conversations: true,
+          messages: false,
+        },
+      },
+    }
+  }
   const envelope = {
     v: 1 as const,
     type: 'conversations_dirty' as const,
@@ -1261,6 +1321,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
   const normalizedSenderMailbox = normalizeMailbox(input.senderMailbox)
   const group = await getActiveChatGroupByMailbox(env, normalizedMailbox)
   if (group) {
+    const latestIndexedMessage = await getLatestChatGroupMessageIndex(env, group.id)
     const members = await listActiveChatGroupRealtimeMembers(env, group.id)
     const uniqueMembers = new Map<string, string>()
     for (const member of members) {
@@ -1274,6 +1335,14 @@ async function resolveRealtimeEventsForIncomingMailbox(
       scope: 'group' as const,
       peer: group.mailbox,
       direction: memberMailbox === normalizedSenderMailbox ? 'outbound' : 'inbound',
+      conversationType: 'group',
+      syncMode: group.sync_mode,
+      groupMailbox: group.mailbox,
+      ...(latestIndexedMessage ? buildRealtimeGroupPayloadEventFields({
+        group,
+        memberMailbox,
+        latestMessage: latestIndexedMessage,
+      }) : {}),
     }))
   }
 
@@ -1282,6 +1351,9 @@ async function resolveRealtimeEventsForIncomingMailbox(
     return []
   }
 
+  const latestEmail = await getLatestDirectConversationEmail(env, normalizedMailbox, normalizedSenderMailbox)
+  const latestText = latestEmail ? extractRealtimeMessageText(latestEmail.body_text, latestEmail.body_html) : ''
+
   return [{
     targetUserId: directUserId,
     mailbox: normalizedMailbox,
@@ -1289,6 +1361,38 @@ async function resolveRealtimeEventsForIncomingMailbox(
     scope: 'direct',
     peer: normalizedSenderMailbox,
     direction: 'inbound',
+    conversationType: 'direct',
+    syncMode: 'mail',
+    ...(latestEmail ? {
+      conversation: {
+        peer: normalizedSenderMailbox,
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        title: normalizedSenderMailbox,
+        peer_display_name: null,
+        peer_alias: null,
+        last_message: latestText,
+        last_direction: 'inbound',
+        last_at: latestEmail.received_at,
+        last_sender_email: normalizedSenderMailbox,
+        last_sender_name: latestEmail.from_name || null,
+        unread_count: 0,
+      } satisfies RealtimeConversationPayload,
+      message: {
+        id: latestEmail.id,
+        peer: normalizedSenderMailbox,
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        direction: 'inbound',
+        text: latestText,
+        sent_at: latestEmail.received_at,
+        status: latestEmail.status === 'failed' ? 'failed' : 'received',
+        sender_email: normalizedSenderMailbox,
+        sender_name: latestEmail.from_name || null,
+      } satisfies RealtimeMessagePayload,
+    } : {}),
   }]
 }
 
@@ -1300,6 +1404,8 @@ async function resolveRealtimeEventForDirectOutboundSender(
   const normalizedPeerMailbox = normalizeMailbox(input.peerMailbox)
   const senderUserId = await findActiveDirectUserIdByMailbox(env, normalizedSenderMailbox)
   if (!senderUserId) return null
+  const latestEmail = await getLatestDirectConversationEmail(env, normalizedSenderMailbox, normalizedPeerMailbox)
+  const latestText = latestEmail ? extractRealtimeMessageText(latestEmail.body_text, latestEmail.body_html) : ''
   return {
     targetUserId: senderUserId,
     mailbox: normalizedSenderMailbox,
@@ -1307,6 +1413,38 @@ async function resolveRealtimeEventForDirectOutboundSender(
     scope: 'direct',
     peer: normalizedPeerMailbox,
     direction: 'outbound',
+    conversationType: 'direct',
+    syncMode: 'mail',
+    ...(latestEmail ? {
+      conversation: {
+        peer: normalizedPeerMailbox,
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        title: normalizedPeerMailbox,
+        peer_display_name: null,
+        peer_alias: null,
+        last_message: latestText,
+        last_direction: 'outbound',
+        last_at: latestEmail.received_at,
+        last_sender_email: normalizedSenderMailbox,
+        last_sender_name: latestEmail.from_name || null,
+        unread_count: 0,
+      } satisfies RealtimeConversationPayload,
+      message: {
+        id: latestEmail.id,
+        peer: normalizedPeerMailbox,
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        direction: 'outbound',
+        text: latestText,
+        sent_at: latestEmail.received_at,
+        status: latestEmail.status === 'failed' ? 'failed' : 'sent',
+        sender_email: normalizedSenderMailbox,
+        sender_name: latestEmail.from_name || null,
+      } satisfies RealtimeMessagePayload,
+    } : {}),
   }
 }
 
@@ -1344,6 +1482,126 @@ async function getActiveChatGroupByMailbox(
       error: error instanceof Error ? error.message : String(error),
     }))
     return null
+  }
+}
+
+async function getLatestChatGroupMessageIndex(
+  env: Env,
+  groupId: string,
+): Promise<{
+  email_id: string
+  sender_email: string
+  sender_name: string | null
+  text: string
+  received_at: string
+} | null> {
+  try {
+    const row = await env.DB.prepare(`
+      SELECT email_id, sender_email, sender_name, text, received_at
+      FROM chat_group_message_index
+      WHERE group_id = ?
+      ORDER BY received_at DESC, email_id DESC
+      LIMIT 1
+    `).bind(groupId).first<{
+      email_id: string
+      sender_email: string
+      sender_name: string | null
+      text: string
+      received_at: string
+    }>()
+    return row ?? null
+  } catch {
+    return null
+  }
+}
+
+async function getLatestDirectConversationEmail(
+  env: Env,
+  mailbox: string,
+  peer: string,
+): Promise<{
+  id: string
+  from_name: string | null
+  body_text: string
+  body_html: string
+  status: 'received' | 'sent' | 'failed' | 'queued'
+  received_at: string
+} | null> {
+  try {
+    const row = await env.DB.prepare(`
+      SELECT id, from_name, body_text, body_html, status, received_at
+      FROM emails
+      WHERE mailbox = ?
+        AND (
+          peer_address = ?
+          OR (peer_address IS NULL AND direction = 'inbound' AND lower(trim(from_address)) = ?)
+          OR (peer_address IS NULL AND direction = 'outbound' AND instr(to_address, ',') = 0 AND lower(trim(to_address)) = ?)
+        )
+      ORDER BY received_at DESC, id DESC
+      LIMIT 1
+    `).bind(mailbox, peer, peer, peer).first<{
+      id: string
+      from_name: string | null
+      body_text: string
+      body_html: string
+      status: 'received' | 'sent' | 'failed' | 'queued'
+      received_at: string
+    }>()
+    return row ?? null
+  } catch {
+    return null
+  }
+}
+
+function extractRealtimeMessageText(bodyText: string | null | undefined, bodyHtml: string | null | undefined): string {
+  const text = nonEmptyTrimmed(bodyText) ?? nonEmptyTrimmed(bodyHtml) ?? ''
+  return text.slice(0, 50000)
+}
+
+function buildRealtimeGroupPayloadEventFields(input: {
+  group: { mailbox: string; sync_mode: 'mail' | 'fast_chat' }
+  memberMailbox: string
+  latestMessage: {
+    email_id: string
+    sender_email: string
+    sender_name: string | null
+    text: string
+    received_at: string
+  }
+}): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
+  const direction: RealtimeNotifyDirection =
+    normalizeMailbox(input.memberMailbox) === normalizeMailbox(input.latestMessage.sender_email)
+      ? 'outbound'
+      : 'inbound'
+  return {
+    conversation: {
+      peer: input.group.mailbox,
+      conversation_type: 'group',
+      group_mailbox: input.group.mailbox,
+      sync_mode: input.group.sync_mode,
+      title: input.group.mailbox,
+      peer_display_name: input.group.mailbox,
+      peer_alias: null,
+      last_message: input.latestMessage.text,
+      last_direction: direction,
+      last_at: input.latestMessage.received_at,
+      last_sender_email: input.latestMessage.sender_email,
+      last_sender_name: input.latestMessage.sender_name,
+      unread_count: 0,
+    },
+    message: {
+      id: input.latestMessage.email_id,
+      peer: input.group.mailbox,
+      conversation_type: 'group',
+      group_mailbox: input.group.mailbox,
+      sync_mode: input.group.sync_mode,
+      direction,
+      text: input.latestMessage.text,
+      sent_at: input.latestMessage.received_at,
+      status: direction === 'outbound' ? 'sent' : 'received',
+      sender_email: input.latestMessage.sender_email,
+      sender_name: input.latestMessage.sender_name,
+    },
   }
 }
 
