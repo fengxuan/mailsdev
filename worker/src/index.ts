@@ -275,6 +275,11 @@ export default {
     scheduleRealtimeNotifyForIncomingMailbox(env, ctx, {
       mailbox,
       senderMailbox: fromAddress,
+      senderName: fromName,
+      bodyText: parsed.bodyText,
+      bodyHtml: parsed.bodyHtml,
+      emailId: id,
+      receivedAt: now,
       source: 'email_inbound',
     })
   },
@@ -1120,13 +1125,27 @@ function isRealtimeNotifyConfigured(env: Env): boolean {
 function scheduleRealtimeNotifyForIncomingMailboxes(
   env: Env,
   ctx: ExecutionContext | undefined,
-  input: { mailboxes: string[]; senderMailbox: string; source: string },
+  input: {
+    mailboxes: string[]
+    senderMailbox: string
+    senderName?: string | null
+    bodyText?: string
+    bodyHtml?: string
+    emailId?: string
+    receivedAt?: string
+    source: string
+  },
 ): void {
   const uniqueMailboxes = [...new Set(input.mailboxes.map(normalizeMailbox))]
   for (const mailbox of uniqueMailboxes) {
     scheduleRealtimeNotifyForIncomingMailbox(env, ctx, {
       mailbox,
       senderMailbox: input.senderMailbox,
+      senderName: input.senderName,
+      bodyText: input.bodyText,
+      bodyHtml: input.bodyHtml,
+      emailId: input.emailId,
+      receivedAt: input.receivedAt,
       source: input.source,
     })
   }
@@ -1135,7 +1154,16 @@ function scheduleRealtimeNotifyForIncomingMailboxes(
 function scheduleRealtimeNotifyForIncomingMailbox(
   env: Env,
   ctx: ExecutionContext | undefined,
-  input: { mailbox: string; senderMailbox: string; source: string },
+  input: {
+    mailbox: string
+    senderMailbox: string
+    senderName?: string | null
+    bodyText?: string
+    bodyHtml?: string
+    emailId?: string
+    receivedAt?: string
+    source: string
+  },
 ): void {
   if (!isRealtimeNotifyConfigured(env)) {
     return
@@ -1146,6 +1174,11 @@ function scheduleRealtimeNotifyForIncomingMailbox(
       const events = await resolveRealtimeEventsForIncomingMailbox(env, {
         mailbox: input.mailbox,
         senderMailbox: input.senderMailbox,
+        senderName: input.senderName,
+        bodyText: input.bodyText,
+        bodyHtml: input.bodyHtml,
+        emailId: input.emailId,
+        receivedAt: input.receivedAt,
         source: input.source,
       })
       await sendRealtimeNotifyEvents(env, events)
@@ -1315,7 +1348,16 @@ function buildRealtimeNotifyEnvelope(event: RealtimeNotifyEvent) {
 
 async function resolveRealtimeEventsForIncomingMailbox(
   env: Env,
-  input: { mailbox: string; senderMailbox: string; source: string },
+  input: {
+    mailbox: string
+    senderMailbox: string
+    senderName?: string | null
+    bodyText?: string
+    bodyHtml?: string
+    emailId?: string
+    receivedAt?: string
+    source: string
+  },
 ): Promise<RealtimeNotifyEvent[]> {
   const normalizedMailbox = normalizeMailbox(input.mailbox)
   const normalizedSenderMailbox = normalizeMailbox(input.senderMailbox)
@@ -1338,11 +1380,24 @@ async function resolveRealtimeEventsForIncomingMailbox(
       conversationType: 'group',
       syncMode: group.sync_mode,
       groupMailbox: group.mailbox,
-      ...(latestIndexedMessage ? buildRealtimeGroupPayloadEventFields({
-        group,
-        memberMailbox,
-        latestMessage: latestIndexedMessage,
-      }) : {}),
+      ...(latestIndexedMessage
+        ? buildRealtimeGroupPayloadEventFields({
+            group,
+            memberMailbox,
+            latestMessage: latestIndexedMessage,
+          })
+        : input.emailId && input.receivedAt
+          ? buildRealtimeGroupPayloadEventFieldsForInboundEmail({
+              group,
+              memberMailbox,
+              emailId: input.emailId,
+              senderMailbox: normalizedSenderMailbox,
+              senderName: nonEmptyTrimmed(input.senderName) ?? null,
+              bodyText: input.bodyText,
+              bodyHtml: input.bodyHtml,
+              receivedAt: input.receivedAt,
+            })
+          : {}),
     }))
   }
 
@@ -1363,36 +1418,47 @@ async function resolveRealtimeEventsForIncomingMailbox(
     direction: 'inbound',
     conversationType: 'direct',
     syncMode: 'mail',
-    ...(latestEmail ? {
-      conversation: {
-        peer: normalizedSenderMailbox,
-        conversation_type: 'direct',
-        group_mailbox: null,
-        sync_mode: 'mail',
-        title: normalizedSenderMailbox,
-        peer_display_name: null,
-        peer_alias: null,
-        last_message: latestText,
-        last_direction: 'inbound',
-        last_at: latestEmail.received_at,
-        last_sender_email: normalizedSenderMailbox,
-        last_sender_name: latestEmail.from_name || null,
-        unread_count: 0,
-      } satisfies RealtimeConversationPayload,
-      message: {
-        id: latestEmail.id,
-        peer: normalizedSenderMailbox,
-        conversation_type: 'direct',
-        group_mailbox: null,
-        sync_mode: 'mail',
-        direction: 'inbound',
-        text: latestText,
-        sent_at: latestEmail.received_at,
-        status: latestEmail.status === 'failed' ? 'failed' : 'received',
-        sender_email: normalizedSenderMailbox,
-        sender_name: latestEmail.from_name || null,
-      } satisfies RealtimeMessagePayload,
-    } : {}),
+    ...(latestEmail
+      ? {
+          conversation: {
+            peer: normalizedSenderMailbox,
+            conversation_type: 'direct',
+            group_mailbox: null,
+            sync_mode: 'mail',
+            title: normalizedSenderMailbox,
+            peer_display_name: null,
+            peer_alias: null,
+            last_message: latestText,
+            last_direction: 'inbound',
+            last_at: latestEmail.received_at,
+            last_sender_email: normalizedSenderMailbox,
+            last_sender_name: latestEmail.from_name || null,
+            unread_count: 0,
+          } satisfies RealtimeConversationPayload,
+          message: {
+            id: latestEmail.id,
+            peer: normalizedSenderMailbox,
+            conversation_type: 'direct',
+            group_mailbox: null,
+            sync_mode: 'mail',
+            direction: 'inbound',
+            text: latestText,
+            sent_at: latestEmail.received_at,
+            status: latestEmail.status === 'failed' ? 'failed' : 'received',
+            sender_email: normalizedSenderMailbox,
+            sender_name: latestEmail.from_name || null,
+          } satisfies RealtimeMessagePayload,
+        }
+      : input.emailId && input.receivedAt
+        ? buildRealtimeDirectPayloadEventFieldsForInboundEmail({
+            peer: normalizedSenderMailbox,
+            emailId: input.emailId,
+            senderName: nonEmptyTrimmed(input.senderName) ?? null,
+            bodyText: input.bodyText,
+            bodyHtml: input.bodyHtml,
+            receivedAt: input.receivedAt,
+          })
+        : {}),
   }]
 }
 
@@ -1601,6 +1667,97 @@ function buildRealtimeGroupPayloadEventFields(input: {
       status: direction === 'outbound' ? 'sent' : 'received',
       sender_email: input.latestMessage.sender_email,
       sender_name: input.latestMessage.sender_name,
+    },
+  }
+}
+
+function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
+  group: { mailbox: string; sync_mode: 'mail' | 'fast_chat' }
+  memberMailbox: string
+  emailId: string
+  senderMailbox: string
+  senderName: string | null
+  bodyText?: string
+  bodyHtml?: string
+  receivedAt: string
+}): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
+  const direction: RealtimeNotifyDirection =
+    normalizeMailbox(input.memberMailbox) === normalizeMailbox(input.senderMailbox)
+      ? 'outbound'
+      : 'inbound'
+  const text = indexedChatMessageText(input.bodyText, input.bodyHtml)
+  const senderMailbox = normalizeMailbox(input.senderMailbox)
+
+  return {
+    conversation: {
+      peer: input.group.mailbox,
+      conversation_type: 'group',
+      group_mailbox: input.group.mailbox,
+      sync_mode: input.group.sync_mode,
+      title: input.group.mailbox,
+      peer_display_name: input.group.mailbox,
+      peer_alias: null,
+      last_message: text,
+      last_direction: direction,
+      last_at: input.receivedAt,
+      last_sender_email: senderMailbox,
+      last_sender_name: input.senderName,
+      unread_count: 0,
+    },
+    message: {
+      id: input.emailId,
+      peer: input.group.mailbox,
+      conversation_type: 'group',
+      group_mailbox: input.group.mailbox,
+      sync_mode: input.group.sync_mode,
+      direction,
+      text,
+      sent_at: input.receivedAt,
+      status: direction === 'outbound' ? 'sent' : 'received',
+      sender_email: senderMailbox,
+      sender_name: input.senderName,
+    },
+  }
+}
+
+function buildRealtimeDirectPayloadEventFieldsForInboundEmail(input: {
+  peer: string
+  emailId: string
+  senderName: string | null
+  bodyText?: string
+  bodyHtml?: string
+  receivedAt: string
+}): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
+  const text = extractRealtimeMessageText(input.bodyText, input.bodyHtml)
+
+  return {
+    conversation: {
+      peer: input.peer,
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      title: input.peer,
+      peer_display_name: null,
+      peer_alias: null,
+      last_message: text,
+      last_direction: 'inbound',
+      last_at: input.receivedAt,
+      last_sender_email: input.peer,
+      last_sender_name: input.senderName,
+      unread_count: 0,
+    },
+    message: {
+      id: input.emailId,
+      peer: input.peer,
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      direction: 'inbound',
+      text,
+      sent_at: input.receivedAt,
+      status: 'received',
+      sender_email: input.peer,
+      sender_name: input.senderName,
     },
   }
 }

@@ -985,7 +985,7 @@ describe('worker: inbound email realtime notify', () => {
     globalThis.fetch = originalFetch
   })
 
-  test('direct inbound email emits direct inbound realtime dirty event', async () => {
+  test('direct inbound email emits direct inbound realtime conversation update', async () => {
     const { db } = createRealtimeRoutingMockD1({
       directUsersByMailbox: {
         'recipient@example.com': 'user-recipient',
@@ -1023,14 +1023,37 @@ describe('worker: inbound email realtime notify', () => {
 
     expect(realtimeNotifyBodies).toHaveLength(1)
     expect(realtimeNotifyBodies[0]!.target.user_id).toBe('user-recipient')
-    expect(realtimeNotifyBodies[0]!.data).toEqual({
-      scope: 'direct',
+    expect(realtimeNotifyBodies[0]!.type).toBe('conversation_updated')
+    expect(realtimeNotifyBodies[0]!.data).toMatchObject({
       peer: 'sender@example.com',
-      direction: 'inbound',
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      conversation: {
+        peer: 'sender@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        last_message: 'Hello',
+        last_direction: 'inbound',
+        last_sender_email: 'sender@example.com',
+        last_sender_name: null,
+      },
+      message: {
+        peer: 'sender@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        direction: 'inbound',
+        text: 'Hello',
+        status: 'received',
+        sender_email: 'sender@example.com',
+        sender_name: null,
+      },
     })
   })
 
-  test('group inbound email fans out realtime dirty events to active members', async () => {
+  test('group inbound email fans out realtime conversation updates to active members', async () => {
     const { db, chatGroupMessageIndexRows } = createRealtimeRoutingMockD1({
       groupsByMailbox: {
         'group@example.com': { id: 'group-1', mailbox: 'group@example.com', sync_mode: 'mail' },
@@ -1069,19 +1092,63 @@ describe('worker: inbound email realtime notify', () => {
     await harness.flush()
 
     expect(realtimeNotifyBodies).toHaveLength(2)
-    const dirtyEvents = realtimeNotifyBodies.filter((body) => body.type === 'conversations_dirty')
+    const updateEvents = realtimeNotifyBodies.filter((body) => body.type === 'conversation_updated')
     const byTarget = Object.fromEntries(
-      dirtyEvents.map((body) => [body.target.user_id as string, body]),
+      updateEvents.map((body) => [body.target.user_id as string, body]),
     )
-    expect(byTarget['user-sender'].data).toEqual({
-      scope: 'group',
+    expect(byTarget['user-sender'].data).toMatchObject({
       peer: 'group@example.com',
-      direction: 'outbound',
+      conversation_type: 'group',
+      group_mailbox: 'group@example.com',
+      sync_mode: 'mail',
+      conversation: {
+        peer: 'group@example.com',
+        conversation_type: 'group',
+        group_mailbox: 'group@example.com',
+        sync_mode: 'mail',
+        last_message: 'Hello group',
+        last_direction: 'outbound',
+        last_sender_email: 'sender@example.com',
+        last_sender_name: null,
+      },
+      message: {
+        peer: 'group@example.com',
+        conversation_type: 'group',
+        group_mailbox: 'group@example.com',
+        sync_mode: 'mail',
+        direction: 'outbound',
+        text: 'Hello group',
+        status: 'sent',
+        sender_email: 'sender@example.com',
+        sender_name: null,
+      },
     })
-    expect(byTarget['user-member'].data).toEqual({
-      scope: 'group',
+    expect(byTarget['user-member'].data).toMatchObject({
       peer: 'group@example.com',
-      direction: 'inbound',
+      conversation_type: 'group',
+      group_mailbox: 'group@example.com',
+      sync_mode: 'mail',
+      conversation: {
+        peer: 'group@example.com',
+        conversation_type: 'group',
+        group_mailbox: 'group@example.com',
+        sync_mode: 'mail',
+        last_message: 'Hello group',
+        last_direction: 'inbound',
+        last_sender_email: 'sender@example.com',
+        last_sender_name: null,
+      },
+      message: {
+        peer: 'group@example.com',
+        conversation_type: 'group',
+        group_mailbox: 'group@example.com',
+        sync_mode: 'mail',
+        direction: 'inbound',
+        text: 'Hello group',
+        status: 'received',
+        sender_email: 'sender@example.com',
+        sender_name: null,
+      },
     })
     expect(chatGroupMessageIndexRows).toHaveLength(1)
     expect(chatGroupMessageIndexRows[0]).toMatchObject({
