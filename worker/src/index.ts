@@ -1,4 +1,5 @@
 import { extractEmailCode } from './extract-code'
+import { buildMailChatProjection } from './mail-chat-projection'
 import { parseIncomingEmail } from './mime'
 import {
   AllProvidersFailedError,
@@ -79,6 +80,7 @@ interface RealtimeConversationPayload {
   peer_display_name: string | null
   peer_alias: string | null
   last_message: string
+  last_render_text?: string | null
   last_direction: RealtimeNotifyDirection
   last_at: string
   last_sender_email: string | null
@@ -94,6 +96,7 @@ interface RealtimeMessagePayload {
   sync_mode: RealtimeSyncMode
   direction: RealtimeNotifyDirection
   text: string
+  render_text?: string | null
   sent_at: string
   status: 'received' | 'sent' | 'failed'
   sender_email: string | null
@@ -117,6 +120,17 @@ interface RealtimeNotifyEvent {
 interface PersistedInboundEmailRef {
   id: string
   mailbox: string
+  receivedAt: string
+}
+
+interface IndexedGroupRealtimeMessageRef {
+  groupId: string
+  groupMailbox: string
+  syncMode: 'mail' | 'fast_chat'
+  emailId: string
+  senderEmail: string
+  senderName: string | null
+  receivedAt: string
 }
 
 export default {
@@ -262,7 +276,7 @@ export default {
     ]
 
     await env.DB.batch(statements)
-    await maybeUpsertChatGroupMessageIndex(env, {
+    const indexedGroupMessage = await maybeUpsertChatGroupMessageIndex(env, {
       emailId: id,
       mailbox,
       senderMailbox: fromAddress,
@@ -280,6 +294,7 @@ export default {
       bodyHtml: parsed.bodyHtml,
       emailId: id,
       receivedAt: now,
+      currentGroupMessage: indexedGroupMessage,
       source: 'email_inbound',
     })
   },
@@ -586,47 +601,55 @@ async function handleSend(
     const localInboundRecipients = localRecipients.filter((recipient) => recipient !== normalizedAuthorizedMailbox)
     const primaryRecipient = localRecipients.length === 1 ? localRecipients[0] ?? null : null
     const messageId = crypto.randomUUID()
+    const senderName = parseFromName(body.from)
+    const outboundReceivedAt = new Date().toISOString()
     await persistOutboundEmail(env, {
       id: messageId,
       mailbox: authorizedMailbox,
       fromAddress: senderMailbox,
-      fromName: parseFromName(body.from),
+      fromName: senderName,
       toAddress: body.to.join(', '),
       subject: body.subject,
       bodyText: body.text,
       bodyHtml: body.html,
       attachmentCount: body.attachments?.length ?? 0,
       provider: 'local',
-      receivedAt: new Date().toISOString(),
+      receivedAt: outboundReceivedAt,
     })
 
     if (localInboundRecipients.length > 0) {
       const persistedInboundEmails = await persistLocalInboundEmails(env, {
         recipients: localInboundRecipients,
         fromAddress: senderMailbox,
-        fromName: parseFromName(body.from),
+        fromName: senderName,
         subject: body.subject,
         bodyText: body.text,
         bodyHtml: body.html,
         replyTo: body.reply_to,
       })
       for (const email of persistedInboundEmails) {
-        await maybeUpsertChatGroupMessageIndex(env, {
+        const indexedGroupMessage = await maybeUpsertChatGroupMessageIndex(env, {
           emailId: email.id,
           mailbox: email.mailbox,
           senderMailbox,
-          senderName: parseFromName(body.from),
+          senderName,
           bodyText: body.text,
           bodyHtml: body.html,
           provider: 'local',
-          receivedAt: new Date().toISOString(),
+          receivedAt: email.receivedAt,
+        })
+        scheduleRealtimeNotifyForIncomingMailbox(env, ctx, {
+          mailbox: email.mailbox,
+          senderMailbox,
+          senderName,
+          bodyText: body.text,
+          bodyHtml: body.html,
+          emailId: email.id,
+          receivedAt: email.receivedAt,
+          currentGroupMessage: indexedGroupMessage,
+          source: 'local_inbound',
         })
       }
-      scheduleRealtimeNotifyForIncomingMailboxes(env, ctx, {
-        mailboxes: localInboundRecipients,
-        senderMailbox,
-        source: 'local_inbound',
-      })
     }
 
     if (primaryRecipient && isRealtimeNotifyConfigured(env)) {
@@ -634,8 +657,14 @@ async function handleSend(
       if (isDirectRecipient) {
         scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
           senderMailbox,
+          senderName,
+          bodyText: body.text,
+          bodyHtml: body.html,
+          emailId: messageId,
+          receivedAt: outboundReceivedAt,
           peerMailbox: primaryRecipient,
           source: 'send_direct_outbound',
+          status: 'sent',
         })
       }
     }
@@ -682,8 +711,14 @@ async function handleSend(
     if (isDirectRecipient) {
       scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
         senderMailbox,
+        senderName: parseFromName(body.from),
+        bodyText: body.text,
+        bodyHtml: body.html,
+        emailId: result.id,
+        receivedAt: now,
         peerMailbox: primaryRecipient,
         source: 'send_direct_outbound',
+        status: 'sent',
       })
     }
   }
@@ -731,6 +766,7 @@ async function persistLocalInboundEmails(
   const persistedEmails = input.recipients.map((recipient) => ({
     id: crypto.randomUUID(),
     mailbox: recipient,
+    receivedAt: now,
   }))
   const statements = persistedEmails.map((email) =>
     env.DB.prepare(`
@@ -751,8 +787,8 @@ async function persistLocalInboundEmails(
       (input.bodyText ?? '').slice(0, 50000),
       (input.bodyHtml ?? '').slice(0, 100000),
       JSON.stringify(buildLocalHeaders(input.fromAddress, input.replyTo)),
-      now,
-      now,
+      email.receivedAt,
+      email.receivedAt,
     )
   )
 
@@ -825,46 +861,69 @@ async function maybeUpsertChatGroupMessageIndex(
     provider: string | null
     receivedAt: string
   },
-): Promise<void> {
+): Promise<IndexedGroupRealtimeMessageRef | null> {
   const group = await getActiveChatGroupByMailbox(env, input.mailbox)
-  if (!group) return
+  if (!group) return null
 
   const normalizedSenderMailbox = normalizeMailbox(input.senderMailbox)
+  const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
   const member = await getActiveChatGroupMemberForIndex(env, group.id, normalizedSenderMailbox)
   if (member) {
+    const senderEmail = member.member_mailbox
+    const senderName = nonEmptyTrimmed(member.display_name) ?? nonEmptyTrimmed(input.senderName)
     await upsertChatGroupMessageIndex(env, {
       groupId: group.id,
       groupMailbox: group.mailbox,
       emailId: input.emailId,
-      senderEmail: member.member_mailbox,
-      senderName: nonEmptyTrimmed(member.display_name) ?? nonEmptyTrimmed(input.senderName),
+      senderEmail,
+      senderName,
       senderSource: 'internal',
-      text: indexedChatMessageText(input.bodyText, input.bodyHtml),
+      text: projection.text,
+      renderText: projection.renderText,
       provider: input.provider,
       receivedAt: input.receivedAt,
     })
-    return
+    return {
+      groupId: group.id,
+      groupMailbox: group.mailbox,
+      syncMode: group.sync_mode,
+      emailId: input.emailId,
+      senderEmail,
+      senderName,
+      receivedAt: input.receivedAt,
+    }
   }
 
   const externalMember = await getActiveChatGroupExternalMemberForIndex(env, group.id, normalizedSenderMailbox)
-  if (!externalMember) return
+  if (!externalMember) return null
 
+  const senderEmail = externalMember.email
+  const senderName = nonEmptyTrimmed(externalMember.display_name) ?? nonEmptyTrimmed(input.senderName)
   await upsertChatGroupMessageIndex(env, {
     groupId: group.id,
     groupMailbox: group.mailbox,
     emailId: input.emailId,
-    senderEmail: externalMember.email,
-    senderName: nonEmptyTrimmed(externalMember.display_name) ?? nonEmptyTrimmed(input.senderName),
+    senderEmail,
+    senderName,
     senderSource: 'external',
-    text: indexedChatMessageText(input.bodyText, input.bodyHtml),
+    text: projection.text,
+    renderText: projection.renderText,
     provider: input.provider,
     receivedAt: input.receivedAt,
   })
+  return {
+    groupId: group.id,
+    groupMailbox: group.mailbox,
+    syncMode: group.sync_mode,
+    emailId: input.emailId,
+    senderEmail,
+    senderName,
+    receivedAt: input.receivedAt,
+  }
 }
 
 function indexedChatMessageText(bodyText?: string, bodyHtml?: string): string {
-  const text = nonEmptyTrimmed(bodyText) ?? nonEmptyTrimmed(bodyHtml) ?? ''
-  return text.slice(0, 50000)
+  return buildRealtimeMessageProjection(bodyText, bodyHtml).text
 }
 
 function nonEmptyTrimmed(value: string | null | undefined): string | null {
@@ -882,6 +941,7 @@ async function upsertChatGroupMessageIndex(
     senderName: string | null
     senderSource: 'internal' | 'external'
     text: string
+    renderText: string | null
     provider: string | null
     receivedAt: string
   },
@@ -890,14 +950,15 @@ async function upsertChatGroupMessageIndex(
   await env.DB.prepare(`
     INSERT INTO chat_group_message_index (
       id, group_id, group_mailbox, email_id, sender_email, sender_name,
-      sender_source, text, provider, received_at, created_at
+      sender_source, text, render_text, provider, received_at, created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(group_id, email_id) DO UPDATE SET
       sender_email = excluded.sender_email,
       sender_name = excluded.sender_name,
       sender_source = excluded.sender_source,
       text = excluded.text,
+      render_text = excluded.render_text,
       provider = excluded.provider,
       received_at = excluded.received_at
   `).bind(
@@ -909,6 +970,7 @@ async function upsertChatGroupMessageIndex(
     input.senderName,
     input.senderSource,
     input.text,
+    input.renderText,
     input.provider,
     input.receivedAt,
     nowIso,
@@ -1133,6 +1195,7 @@ function scheduleRealtimeNotifyForIncomingMailboxes(
     bodyHtml?: string
     emailId?: string
     receivedAt?: string
+    currentGroupMessage?: IndexedGroupRealtimeMessageRef | null
     source: string
   },
 ): void {
@@ -1146,6 +1209,7 @@ function scheduleRealtimeNotifyForIncomingMailboxes(
       bodyHtml: input.bodyHtml,
       emailId: input.emailId,
       receivedAt: input.receivedAt,
+      currentGroupMessage: input.currentGroupMessage,
       source: input.source,
     })
   }
@@ -1162,6 +1226,7 @@ function scheduleRealtimeNotifyForIncomingMailbox(
     bodyHtml?: string
     emailId?: string
     receivedAt?: string
+    currentGroupMessage?: IndexedGroupRealtimeMessageRef | null
     source: string
   },
 ): void {
@@ -1179,6 +1244,7 @@ function scheduleRealtimeNotifyForIncomingMailbox(
         bodyHtml: input.bodyHtml,
         emailId: input.emailId,
         receivedAt: input.receivedAt,
+        currentGroupMessage: input.currentGroupMessage,
         source: input.source,
       })
       await sendRealtimeNotifyEvents(env, events)
@@ -1198,7 +1264,17 @@ function scheduleRealtimeNotifyForIncomingMailbox(
 function scheduleRealtimeNotifyForDirectOutboundSender(
   env: Env,
   ctx: ExecutionContext | undefined,
-  input: { senderMailbox: string; peerMailbox: string; source: string },
+  input: {
+    senderMailbox: string
+    senderName?: string | null
+    bodyText?: string
+    bodyHtml?: string
+    emailId?: string
+    receivedAt?: string
+    peerMailbox: string
+    source: string
+    status?: 'sent' | 'failed'
+  },
 ): void {
   if (!isRealtimeNotifyConfigured(env)) {
     return
@@ -1356,14 +1432,23 @@ async function resolveRealtimeEventsForIncomingMailbox(
     bodyHtml?: string
     emailId?: string
     receivedAt?: string
+    currentGroupMessage?: IndexedGroupRealtimeMessageRef | null
     source: string
   },
 ): Promise<RealtimeNotifyEvent[]> {
   const normalizedMailbox = normalizeMailbox(input.mailbox)
   const normalizedSenderMailbox = normalizeMailbox(input.senderMailbox)
-  const group = await getActiveChatGroupByMailbox(env, normalizedMailbox)
+  const group = input.currentGroupMessage && normalizeMailbox(input.currentGroupMessage.groupMailbox) === normalizedMailbox
+    ? {
+        id: input.currentGroupMessage.groupId,
+        mailbox: normalizeMailbox(input.currentGroupMessage.groupMailbox),
+        sync_mode: input.currentGroupMessage.syncMode,
+      }
+    : await getActiveChatGroupByMailbox(env, normalizedMailbox)
   if (group) {
-    const latestIndexedMessage = await getLatestChatGroupMessageIndex(env, group.id)
+    const latestIndexedMessage = input.currentGroupMessage && input.currentGroupMessage.groupId === group.id
+      ? null
+      : await getLatestChatGroupMessageIndex(env, group.id)
     const members = await listActiveChatGroupRealtimeMembers(env, group.id)
     const uniqueMembers = new Map<string, string>()
     for (const member of members) {
@@ -1380,7 +1465,18 @@ async function resolveRealtimeEventsForIncomingMailbox(
       conversationType: 'group',
       syncMode: group.sync_mode,
       groupMailbox: group.mailbox,
-      ...(latestIndexedMessage
+      ...(input.currentGroupMessage && input.emailId && input.receivedAt
+        ? buildRealtimeGroupPayloadEventFieldsForInboundEmail({
+            group,
+            memberMailbox,
+            emailId: input.currentGroupMessage.emailId,
+            senderMailbox: input.currentGroupMessage.senderEmail,
+            senderName: input.currentGroupMessage.senderName,
+            bodyText: input.bodyText,
+            bodyHtml: input.bodyHtml,
+            receivedAt: input.currentGroupMessage.receivedAt,
+          })
+        : latestIndexedMessage
         ? buildRealtimeGroupPayloadEventFields({
             group,
             memberMailbox,
@@ -1406,8 +1502,31 @@ async function resolveRealtimeEventsForIncomingMailbox(
     return []
   }
 
+  if (input.emailId && input.receivedAt) {
+    return [{
+      targetUserId: directUserId,
+      mailbox: normalizedMailbox,
+      source: input.source,
+      scope: 'direct',
+      peer: normalizedSenderMailbox,
+      direction: 'inbound',
+      conversationType: 'direct',
+      syncMode: 'mail',
+      ...buildRealtimeDirectPayloadEventFieldsForInboundEmail({
+        peer: normalizedSenderMailbox,
+        emailId: input.emailId,
+        senderName: nonEmptyTrimmed(input.senderName) ?? null,
+        bodyText: input.bodyText,
+        bodyHtml: input.bodyHtml,
+        receivedAt: input.receivedAt,
+      }),
+    }]
+  }
+
   const latestEmail = await getLatestDirectConversationEmail(env, normalizedMailbox, normalizedSenderMailbox)
-  const latestText = latestEmail ? extractRealtimeMessageText(latestEmail.body_text, latestEmail.body_html) : ''
+  const latestProjection = latestEmail
+    ? buildRealtimeMessageProjection(latestEmail.body_text, latestEmail.body_html)
+    : EMPTY_REALTIME_MESSAGE_PROJECTION
 
   return [{
     targetUserId: directUserId,
@@ -1428,7 +1547,8 @@ async function resolveRealtimeEventsForIncomingMailbox(
             title: normalizedSenderMailbox,
             peer_display_name: null,
             peer_alias: null,
-            last_message: latestText,
+            last_message: latestProjection.text,
+            ...(latestProjection.renderText ? { last_render_text: latestProjection.renderText } : {}),
             last_direction: 'inbound',
             last_at: latestEmail.received_at,
             last_sender_email: normalizedSenderMailbox,
@@ -1442,36 +1562,64 @@ async function resolveRealtimeEventsForIncomingMailbox(
             group_mailbox: null,
             sync_mode: 'mail',
             direction: 'inbound',
-            text: latestText,
+            text: latestProjection.text,
+            ...(latestProjection.renderText ? { render_text: latestProjection.renderText } : {}),
             sent_at: latestEmail.received_at,
             status: latestEmail.status === 'failed' ? 'failed' : 'received',
             sender_email: normalizedSenderMailbox,
             sender_name: latestEmail.from_name || null,
           } satisfies RealtimeMessagePayload,
         }
-      : input.emailId && input.receivedAt
-        ? buildRealtimeDirectPayloadEventFieldsForInboundEmail({
-            peer: normalizedSenderMailbox,
-            emailId: input.emailId,
-            senderName: nonEmptyTrimmed(input.senderName) ?? null,
-            bodyText: input.bodyText,
-            bodyHtml: input.bodyHtml,
-            receivedAt: input.receivedAt,
-          })
-        : {}),
+      : {}),
   }]
 }
 
 async function resolveRealtimeEventForDirectOutboundSender(
   env: Env,
-  input: { senderMailbox: string; peerMailbox: string; source: string },
+  input: {
+    senderMailbox: string
+    senderName?: string | null
+    bodyText?: string
+    bodyHtml?: string
+    emailId?: string
+    receivedAt?: string
+    peerMailbox: string
+    source: string
+    status?: 'sent' | 'failed'
+  },
 ): Promise<RealtimeNotifyEvent | null> {
   const normalizedSenderMailbox = normalizeMailbox(input.senderMailbox)
   const normalizedPeerMailbox = normalizeMailbox(input.peerMailbox)
   const senderUserId = await findActiveDirectUserIdByMailbox(env, normalizedSenderMailbox)
   if (!senderUserId) return null
+
+  if (input.emailId && input.receivedAt) {
+    return {
+      targetUserId: senderUserId,
+      mailbox: normalizedSenderMailbox,
+      source: input.source,
+      scope: 'direct',
+      peer: normalizedPeerMailbox,
+      direction: 'outbound',
+      conversationType: 'direct',
+      syncMode: 'mail',
+      ...buildRealtimeDirectPayloadEventFieldsForOutboundEmail({
+        peer: normalizedPeerMailbox,
+        emailId: input.emailId,
+        senderMailbox: normalizedSenderMailbox,
+        senderName: nonEmptyTrimmed(input.senderName) ?? null,
+        bodyText: input.bodyText,
+        bodyHtml: input.bodyHtml,
+        receivedAt: input.receivedAt,
+        status: input.status ?? 'sent',
+      }),
+    }
+  }
+
   const latestEmail = await getLatestDirectConversationEmail(env, normalizedSenderMailbox, normalizedPeerMailbox)
-  const latestText = latestEmail ? extractRealtimeMessageText(latestEmail.body_text, latestEmail.body_html) : ''
+  const latestProjection = latestEmail
+    ? buildRealtimeMessageProjection(latestEmail.body_text, latestEmail.body_html)
+    : EMPTY_REALTIME_MESSAGE_PROJECTION
   return {
     targetUserId: senderUserId,
     mailbox: normalizedSenderMailbox,
@@ -1490,7 +1638,8 @@ async function resolveRealtimeEventForDirectOutboundSender(
         title: normalizedPeerMailbox,
         peer_display_name: null,
         peer_alias: null,
-        last_message: latestText,
+        last_message: latestProjection.text,
+        ...(latestProjection.renderText ? { last_render_text: latestProjection.renderText } : {}),
         last_direction: 'outbound',
         last_at: latestEmail.received_at,
         last_sender_email: normalizedSenderMailbox,
@@ -1504,7 +1653,8 @@ async function resolveRealtimeEventForDirectOutboundSender(
         group_mailbox: null,
         sync_mode: 'mail',
         direction: 'outbound',
-        text: latestText,
+        text: latestProjection.text,
+        ...(latestProjection.renderText ? { render_text: latestProjection.renderText } : {}),
         sent_at: latestEmail.received_at,
         status: latestEmail.status === 'failed' ? 'failed' : 'sent',
         sender_email: normalizedSenderMailbox,
@@ -1559,11 +1709,12 @@ async function getLatestChatGroupMessageIndex(
   sender_email: string
   sender_name: string | null
   text: string
+  render_text: string | null
   received_at: string
 } | null> {
   try {
     const row = await env.DB.prepare(`
-      SELECT email_id, sender_email, sender_name, text, received_at
+      SELECT email_id, sender_email, sender_name, text, render_text, received_at
       FROM chat_group_message_index
       WHERE group_id = ?
       ORDER BY received_at DESC, email_id DESC
@@ -1573,6 +1724,7 @@ async function getLatestChatGroupMessageIndex(
       sender_email: string
       sender_name: string | null
       text: string
+      render_text: string | null
       received_at: string
     }>()
     return row ?? null
@@ -1620,8 +1772,7 @@ async function getLatestDirectConversationEmail(
 }
 
 function extractRealtimeMessageText(bodyText: string | null | undefined, bodyHtml: string | null | undefined): string {
-  const text = nonEmptyTrimmed(bodyText) ?? nonEmptyTrimmed(bodyHtml) ?? ''
-  return text.slice(0, 50000)
+  return buildRealtimeMessageProjection(bodyText, bodyHtml).text
 }
 
 function buildRealtimeGroupPayloadEventFields(input: {
@@ -1632,6 +1783,7 @@ function buildRealtimeGroupPayloadEventFields(input: {
     sender_email: string
     sender_name: string | null
     text: string
+    render_text: string | null
     received_at: string
   }
 }): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
@@ -1649,6 +1801,7 @@ function buildRealtimeGroupPayloadEventFields(input: {
       peer_display_name: input.group.mailbox,
       peer_alias: null,
       last_message: input.latestMessage.text,
+      ...(input.latestMessage.render_text ? { last_render_text: input.latestMessage.render_text } : {}),
       last_direction: direction,
       last_at: input.latestMessage.received_at,
       last_sender_email: input.latestMessage.sender_email,
@@ -1663,6 +1816,7 @@ function buildRealtimeGroupPayloadEventFields(input: {
       sync_mode: input.group.sync_mode,
       direction,
       text: input.latestMessage.text,
+      ...(input.latestMessage.render_text ? { render_text: input.latestMessage.render_text } : {}),
       sent_at: input.latestMessage.received_at,
       status: direction === 'outbound' ? 'sent' : 'received',
       sender_email: input.latestMessage.sender_email,
@@ -1685,7 +1839,7 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
     normalizeMailbox(input.memberMailbox) === normalizeMailbox(input.senderMailbox)
       ? 'outbound'
       : 'inbound'
-  const text = indexedChatMessageText(input.bodyText, input.bodyHtml)
+  const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
   const senderMailbox = normalizeMailbox(input.senderMailbox)
 
   return {
@@ -1697,7 +1851,8 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
       title: input.group.mailbox,
       peer_display_name: input.group.mailbox,
       peer_alias: null,
-      last_message: text,
+      last_message: projection.text,
+      ...(projection.renderText ? { last_render_text: projection.renderText } : {}),
       last_direction: direction,
       last_at: input.receivedAt,
       last_sender_email: senderMailbox,
@@ -1711,7 +1866,8 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
       group_mailbox: input.group.mailbox,
       sync_mode: input.group.sync_mode,
       direction,
-      text,
+      text: projection.text,
+      ...(projection.renderText ? { render_text: projection.renderText } : {}),
       sent_at: input.receivedAt,
       status: direction === 'outbound' ? 'sent' : 'received',
       sender_email: senderMailbox,
@@ -1728,7 +1884,7 @@ function buildRealtimeDirectPayloadEventFieldsForInboundEmail(input: {
   bodyHtml?: string
   receivedAt: string
 }): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
-  const text = extractRealtimeMessageText(input.bodyText, input.bodyHtml)
+  const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
 
   return {
     conversation: {
@@ -1739,7 +1895,8 @@ function buildRealtimeDirectPayloadEventFieldsForInboundEmail(input: {
       title: input.peer,
       peer_display_name: null,
       peer_alias: null,
-      last_message: text,
+      last_message: projection.text,
+      ...(projection.renderText ? { last_render_text: projection.renderText } : {}),
       last_direction: 'inbound',
       last_at: input.receivedAt,
       last_sender_email: input.peer,
@@ -1753,13 +1910,77 @@ function buildRealtimeDirectPayloadEventFieldsForInboundEmail(input: {
       group_mailbox: null,
       sync_mode: 'mail',
       direction: 'inbound',
-      text,
+      text: projection.text,
+      ...(projection.renderText ? { render_text: projection.renderText } : {}),
       sent_at: input.receivedAt,
       status: 'received',
       sender_email: input.peer,
       sender_name: input.senderName,
     },
   }
+}
+
+function buildRealtimeDirectPayloadEventFieldsForOutboundEmail(input: {
+  peer: string
+  emailId: string
+  senderMailbox: string
+  senderName: string | null
+  bodyText?: string
+  bodyHtml?: string
+  receivedAt: string
+  status: 'sent' | 'failed'
+}): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
+  const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
+
+  return {
+    conversation: {
+      peer: input.peer,
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      title: input.peer,
+      peer_display_name: null,
+      peer_alias: null,
+      last_message: projection.text,
+      ...(projection.renderText ? { last_render_text: projection.renderText } : {}),
+      last_direction: 'outbound',
+      last_at: input.receivedAt,
+      last_sender_email: input.senderMailbox,
+      last_sender_name: input.senderName,
+      unread_count: 0,
+    },
+    message: {
+      id: input.emailId,
+      peer: input.peer,
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      direction: 'outbound',
+      text: projection.text,
+      ...(projection.renderText ? { render_text: projection.renderText } : {}),
+      sent_at: input.receivedAt,
+      status: input.status,
+      sender_email: input.senderMailbox,
+      sender_name: input.senderName,
+    },
+  }
+}
+
+const EMPTY_REALTIME_MESSAGE_PROJECTION = {
+  text: '',
+  renderText: null,
+}
+
+function buildRealtimeMessageProjection(
+  bodyText: string | null | undefined,
+  bodyHtml: string | null | undefined,
+): { text: string; renderText: string | null } {
+  const normalizedBodyText = typeof bodyText === 'string' ? bodyText.slice(0, 50_000) : undefined
+  const normalizedBodyHtml = typeof bodyHtml === 'string' ? bodyHtml.slice(0, 100_000) : undefined
+  return buildMailChatProjection({
+    bodyText: normalizedBodyText,
+    bodyHTML: normalizedBodyHtml,
+  })
 }
 
 async function listActiveChatGroupRealtimeMembers(

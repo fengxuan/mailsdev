@@ -260,9 +260,10 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
               sender_name: args[5] === null ? null : String(args[5] ?? ''),
               sender_source: String(args[6] ?? ''),
               text: String(args[7] ?? ''),
-              provider: args[8] === null ? null : String(args[8] ?? ''),
-              received_at: String(args[9] ?? ''),
-              created_at: String(args[10] ?? ''),
+              render_text: args[8] === null ? null : String(args[8] ?? ''),
+              provider: args[9] === null ? null : String(args[9] ?? ''),
+              received_at: String(args[10] ?? ''),
+              created_at: String(args[11] ?? ''),
             })
             return { success: true }
           },
@@ -757,7 +758,7 @@ describe('worker: POST /api/send', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
-  test('local direct send emits inbound and outbound realtime dirty events', async () => {
+  test('local direct send emits inbound and outbound realtime conversation updates', async () => {
     const { db } = createRealtimeRoutingMockD1({
       localUsers: ['you@example.com'],
       directUsersByMailbox: {
@@ -797,25 +798,70 @@ describe('worker: POST /api/send', () => {
 
     expect(response.status).toBe(200)
     expect(realtimeNotifyBodies).toHaveLength(2)
-    const dirtyEvents = realtimeNotifyBodies.filter((body) => body.type === 'conversations_dirty')
+    const updateEvents = realtimeNotifyBodies.filter((body) => body.type === 'conversation_updated')
+    expect(updateEvents).toHaveLength(2)
     const byTarget = Object.fromEntries(
-      dirtyEvents.map((body) => [body.target.user_id as string, body]),
+      updateEvents.map((body) => [body.target.user_id as string, body]),
     )
     expect(byTarget['user-you']).toBeTruthy()
-    expect(byTarget['user-you'].data).toEqual({
-      scope: 'direct',
+    expect(byTarget['user-you'].data).toMatchObject({
       peer: 'me@example.com',
-      direction: 'inbound',
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      conversation: {
+        peer: 'me@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        last_message: 'World',
+        last_direction: 'inbound',
+        last_sender_email: 'me@example.com',
+        last_sender_name: null,
+      },
+      message: {
+        peer: 'me@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        direction: 'inbound',
+        text: 'World',
+        status: 'received',
+        sender_email: 'me@example.com',
+        sender_name: null,
+      },
     })
     expect(byTarget['user-me']).toBeTruthy()
-    expect(byTarget['user-me'].data).toEqual({
-      scope: 'direct',
+    expect(byTarget['user-me'].data).toMatchObject({
       peer: 'you@example.com',
-      direction: 'outbound',
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      conversation: {
+        peer: 'you@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        last_message: 'World',
+        last_direction: 'outbound',
+        last_sender_email: 'me@example.com',
+        last_sender_name: null,
+      },
+      message: {
+        peer: 'you@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        direction: 'outbound',
+        text: 'World',
+        status: 'sent',
+        sender_email: 'me@example.com',
+        sender_name: null,
+      },
     })
   })
 
-  test('local group send fans out realtime dirty events to active group members', async () => {
+  test('local group send fans out realtime conversation updates to active group members', async () => {
     const { db, chatGroupMessageIndexRows } = createRealtimeRoutingMockD1({
       localUsers: ['group@example.com'],
       groupsByMailbox: {
@@ -859,21 +905,66 @@ describe('worker: POST /api/send', () => {
 
     expect(response.status).toBe(200)
     expect(realtimeNotifyBodies).toHaveLength(2)
-    const dirtyEvents = realtimeNotifyBodies.filter((body) => body.type === 'conversations_dirty')
+    const updateEvents = realtimeNotifyBodies.filter((body) => body.type === 'conversation_updated')
+    expect(updateEvents).toHaveLength(2)
     const byTarget = Object.fromEntries(
-      dirtyEvents.map((body) => [body.target.user_id as string, body]),
+      updateEvents.map((body) => [body.target.user_id as string, body]),
     )
     expect(byTarget['user-me']).toBeTruthy()
-    expect(byTarget['user-me'].data).toEqual({
-      scope: 'group',
+    expect(byTarget['user-me'].data).toMatchObject({
       peer: 'group@example.com',
-      direction: 'outbound',
+      conversation_type: 'group',
+      group_mailbox: 'group@example.com',
+      sync_mode: 'mail',
+      conversation: {
+        peer: 'group@example.com',
+        conversation_type: 'group',
+        group_mailbox: 'group@example.com',
+        sync_mode: 'mail',
+        last_message: 'World',
+        last_direction: 'outbound',
+        last_sender_email: 'me@example.com',
+        last_sender_name: 'Me',
+      },
+      message: {
+        peer: 'group@example.com',
+        conversation_type: 'group',
+        group_mailbox: 'group@example.com',
+        sync_mode: 'mail',
+        direction: 'outbound',
+        text: 'World',
+        status: 'sent',
+        sender_email: 'me@example.com',
+        sender_name: 'Me',
+      },
     })
     expect(byTarget['user-member']).toBeTruthy()
-    expect(byTarget['user-member'].data).toEqual({
-      scope: 'group',
+    expect(byTarget['user-member'].data).toMatchObject({
       peer: 'group@example.com',
-      direction: 'inbound',
+      conversation_type: 'group',
+      group_mailbox: 'group@example.com',
+      sync_mode: 'mail',
+      conversation: {
+        peer: 'group@example.com',
+        conversation_type: 'group',
+        group_mailbox: 'group@example.com',
+        sync_mode: 'mail',
+        last_message: 'World',
+        last_direction: 'inbound',
+        last_sender_email: 'me@example.com',
+        last_sender_name: 'Me',
+      },
+      message: {
+        peer: 'group@example.com',
+        conversation_type: 'group',
+        group_mailbox: 'group@example.com',
+        sync_mode: 'mail',
+        direction: 'inbound',
+        text: 'World',
+        status: 'received',
+        sender_email: 'me@example.com',
+        sender_name: 'Me',
+      },
     })
     expect(chatGroupMessageIndexRows).toHaveLength(1)
     expect(chatGroupMessageIndexRows[0]).toMatchObject({
@@ -949,14 +1040,18 @@ function makeForwardableEmailMessage(input: {
   to: string
   from: string
   subject: string
-  bodyText: string
+  bodyText?: string
+  bodyHtml?: string
 }): ForwardableEmailMessage {
+  const contentType = input.bodyHtml ? 'text/html; charset="utf-8"' : 'text/plain; charset="utf-8"'
+  const body = input.bodyHtml ?? input.bodyText ?? ''
   const raw = [
     `From: ${input.from}`,
     `To: ${input.to}`,
     `Subject: ${input.subject}`,
+    `Content-Type: ${contentType}`,
     '',
-    input.bodyText,
+    body,
     '',
   ].join('\r\n')
   const bytes = new TextEncoder().encode(raw)
@@ -973,6 +1068,7 @@ function makeForwardableEmailMessage(input: {
       from: input.from,
       to: input.to,
       subject: input.subject,
+      'content-type': contentType,
     }),
     raw: stream,
   } as unknown as ForwardableEmailMessage
@@ -986,7 +1082,7 @@ describe('worker: inbound email realtime notify', () => {
   })
 
   test('direct inbound email emits direct inbound realtime conversation update', async () => {
-    const { db } = createRealtimeRoutingMockD1({
+    const { db, prepareMock } = createRealtimeRoutingMockD1({
       directUsersByMailbox: {
         'recipient@example.com': 'user-recipient',
       },
@@ -1051,10 +1147,75 @@ describe('worker: inbound email realtime notify', () => {
         sender_name: null,
       },
     })
+    const preparedSQL = (prepareMock as any).mock.calls.map(([sql]: [string]) => String(sql))
+    expect(preparedSQL.some((sql: string) => sql.includes('FROM emails') && sql.includes('peer_address = ?'))).toBe(false)
+  })
+
+  test('direct inbound html email includes cleaned text and render_text in realtime payload', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      directUsersByMailbox: {
+        'recipient@example.com': 'user-recipient',
+      },
+    })
+    const env = {
+      DB: db,
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    } as Env
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify') {
+        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'FYI',
+      bodyHtml: [
+        '<div>帮我看下</div>',
+        '<div>- - - - - 原 始 邮 件 - - - - -</div>',
+        '<div>发件人：Alice &lt;alice@example.com&gt;</div>',
+        '<div>发送时间：2026年5月18日 10:00</div>',
+        '<div>收件人：Team &lt;team@example.com&gt;</div>',
+        '<div>主 题：Roadmap</div>',
+        '<div><br></div>',
+        '<div>请看这个计划。</div>',
+      ].join(''),
+    })
+    const harness = createExecutionContextHarness()
+    await worker.email(message, env, harness.ctx)
+    await harness.flush()
+
+    expect(realtimeNotifyBodies).toHaveLength(1)
+    expect(realtimeNotifyBodies[0]!.type).toBe('conversation_updated')
+    expect(realtimeNotifyBodies[0]!.data).toMatchObject({
+      peer: 'sender@example.com',
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      message: {
+        render_text: expect.stringContaining('<div>帮我看下</div>'),
+      },
+    })
+    const conversation = realtimeNotifyBodies[0]!.data.conversation as Record<string, unknown>
+    const payloadMessage = realtimeNotifyBodies[0]!.data.message as Record<string, unknown>
+    expect(String(conversation.last_message ?? '')).toContain('帮我看下')
+    expect(String(conversation.last_message ?? '')).toContain('请看这个计划。')
+    expect(String(conversation.last_message ?? '')).not.toContain('原 始 邮 件')
+    expect(String(conversation.last_message ?? '')).not.toContain('发件人：')
+    expect(String(payloadMessage.text ?? '')).toContain('帮我看下')
+    expect(String(payloadMessage.text ?? '')).toContain('请看这个计划。')
+    expect(String(payloadMessage.text ?? '')).not.toContain('原 始 邮 件')
+    expect(String(payloadMessage.text ?? '')).not.toContain('发件人：')
   })
 
   test('group inbound email fans out realtime conversation updates to active members', async () => {
-    const { db, chatGroupMessageIndexRows } = createRealtimeRoutingMockD1({
+    const { db, chatGroupMessageIndexRows, prepareMock } = createRealtimeRoutingMockD1({
       groupsByMailbox: {
         'group@example.com': { id: 'group-1', mailbox: 'group@example.com', sync_mode: 'mail' },
       },
@@ -1109,7 +1270,7 @@ describe('worker: inbound email realtime notify', () => {
         last_message: 'Hello group',
         last_direction: 'outbound',
         last_sender_email: 'sender@example.com',
-        last_sender_name: null,
+        last_sender_name: 'Sender',
       },
       message: {
         peer: 'group@example.com',
@@ -1120,7 +1281,7 @@ describe('worker: inbound email realtime notify', () => {
         text: 'Hello group',
         status: 'sent',
         sender_email: 'sender@example.com',
-        sender_name: null,
+        sender_name: 'Sender',
       },
     })
     expect(byTarget['user-member'].data).toMatchObject({
@@ -1136,7 +1297,7 @@ describe('worker: inbound email realtime notify', () => {
         last_message: 'Hello group',
         last_direction: 'inbound',
         last_sender_email: 'sender@example.com',
-        last_sender_name: null,
+        last_sender_name: 'Sender',
       },
       message: {
         peer: 'group@example.com',
@@ -1147,7 +1308,7 @@ describe('worker: inbound email realtime notify', () => {
         text: 'Hello group',
         status: 'received',
         sender_email: 'sender@example.com',
-        sender_name: null,
+        sender_name: 'Sender',
       },
     })
     expect(chatGroupMessageIndexRows).toHaveLength(1)
@@ -1161,6 +1322,80 @@ describe('worker: inbound email realtime notify', () => {
       text: 'Hello group',
       provider: null,
     })
+    const preparedSQL = (prepareMock as any).mock.calls.map(([sql]: [string]) => String(sql))
+    expect(preparedSQL.some((sql: string) => sql.includes('FROM chat_group_message_index') && sql.includes('ORDER BY received_at DESC'))).toBe(false)
+  })
+
+  test('group inbound html email includes cleaned text and render_text in realtime payload', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      groupsByMailbox: {
+        'group@example.com': { id: 'group-1', mailbox: 'group@example.com', sync_mode: 'mail' },
+      },
+      groupMembersByGroupID: {
+        'group-1': [
+          { user_id: 'user-sender', member_mailbox: 'sender@example.com', display_name: 'Sender' },
+          { user_id: 'user-member', member_mailbox: 'member@example.com', display_name: 'Member' },
+        ],
+      },
+    })
+    const env = {
+      DB: db,
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    } as Env
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify-batch') {
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        realtimeNotifyBodies.push(...(body.events ?? []))
+        return new Response(JSON.stringify({ ok: true, count: (body.events ?? []).length }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'group@example.com',
+      subject: 'FYI',
+      bodyHtml: [
+        '<div>帮我看下</div>',
+        '<div>- - - - - 原 始 邮 件 - - - - -</div>',
+        '<div>发件人：Alice &lt;alice@example.com&gt;</div>',
+        '<div>发送时间：2026年5月18日 10:00</div>',
+        '<div>收件人：Team &lt;team@example.com&gt;</div>',
+        '<div>主 题：Roadmap</div>',
+        '<div><br></div>',
+        '<div>请看这个计划。</div>',
+      ].join(''),
+    })
+    const harness = createExecutionContextHarness()
+    await worker.email(message, env, harness.ctx)
+    await harness.flush()
+
+    expect(realtimeNotifyBodies).toHaveLength(2)
+    const updateEvents = realtimeNotifyBodies.filter((body) => body.type === 'conversation_updated')
+    expect(updateEvents).toHaveLength(2)
+    for (const event of updateEvents) {
+      expect(event.data).toMatchObject({
+        peer: 'group@example.com',
+        conversation_type: 'group',
+        group_mailbox: 'group@example.com',
+        sync_mode: 'mail',
+        message: {
+          render_text: expect.stringContaining('<div>帮我看下</div>'),
+        },
+      })
+      const conversation = event.data.conversation as Record<string, unknown>
+      const payloadMessage = event.data.message as Record<string, unknown>
+      expect(String(conversation.last_message ?? '')).toContain('帮我看下')
+      expect(String(conversation.last_message ?? '')).toContain('请看这个计划。')
+      expect(String(conversation.last_message ?? '')).not.toContain('原 始 邮 件')
+      expect(String(payloadMessage.text ?? '')).toContain('帮我看下')
+      expect(String(payloadMessage.text ?? '')).toContain('请看这个计划。')
+      expect(String(payloadMessage.text ?? '')).not.toContain('原 始 邮 件')
+      expect(String(payloadMessage.sender_name ?? '')).toBe('Sender')
+    }
   })
 
   test('fast_chat group inbound email is ignored', async () => {

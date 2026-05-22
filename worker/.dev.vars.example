@@ -1,6 +1,23 @@
+# Basic single-mailbox local auth.
 MAILBOX=agent@example.com
 AUTH_TOKEN=replace_me_for_agent_example_com
+
+# Optional multi-mailbox form. Use this instead of MAILBOX/AUTH_TOKEN when needed.
 # AUTH_TOKENS_JSON={"agent@example.com":"token_for_agent","other@example.com":"token_for_other"}
+
+# Optional outbound email provider key for real send API usage.
 RESEND_API_KEY=re_optional_if_you_want_send_api
-REALTIME_NOTIFY_BASE_URL=https://mails-realtime-notify.example.com
-REALTIME_INTERNAL_TOKEN=replace_me_for_realtime_notify
+
+# Realtime relay wiring.
+REALTIME_NOTIFY_BASE_URL=http://127.0.0.1:3171
+REALTIME_INTERNAL_TOKEN=replace_me_shared_with_mails_chat_api_and_realtime_notify
+
+# Optional provider selection override.
+# EMAIL_PROVIDERS=cloudflare,resend,ses
+
+# Optional SES secrets if you want SES instead of or in addition to Resend.
+# AWS_SES_REGION=us-east-1
+# AWS_ACCESS_KEY_ID=replace_me
+# AWS_SECRET_ACCESS_KEY=replace_me
+# AWS_SESSION_TOKEN=replace_me_if_temporary_credentials
+# AWS_SES_ENDPOINT=https://email.us-east-1.amazonaws.com
