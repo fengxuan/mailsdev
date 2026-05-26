@@ -595,11 +595,18 @@ async function handleSend(
     attachments: body.attachments,
   }
 
-  const localRecipients = await resolveLocalRecipients(env, body.to)
-  if (localRecipients) {
+  const allRecipientFields = [
+    ...(body.to ?? []),
+    ...(body.cc ?? []),
+    ...(body.bcc ?? []),
+  ]
+  const localRecipients = await resolveLocalRecipients(env, allRecipientFields)
+  if (localRecipients && localRecipients.length === allRecipientFields.length) {
     const normalizedAuthorizedMailbox = normalizeMailbox(authorizedMailbox)
     const localInboundRecipients = localRecipients.filter((recipient) => recipient !== normalizedAuthorizedMailbox)
-    const primaryRecipient = localRecipients.length === 1 ? localRecipients[0] ?? null : null
+    const primaryRecipient = body.to.length === 1 && !body.cc?.length && !body.bcc?.length
+      ? localRecipients[0] ?? null
+      : null
     const messageId = crypto.randomUUID()
     const senderName = parseFromName(body.from)
     const outboundReceivedAt = new Date().toISOString()

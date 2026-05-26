@@ -861,6 +861,67 @@ describe('worker: POST /api/send', () => {
     })
   })
 
+  test('mixed local to plus external bcc stays as one outbound email', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      localUsers: ['you@example.com'],
+    })
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      RESEND_API_KEY: 're_test_key',
+    })
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...SEND_BODY,
+        to: ['you@example.com'],
+        bcc: ['friend@outside.com'],
+      }),
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { provider: string }
+
+    expect(response.status).toBe(200)
+    expect(json.provider).toBe('resend')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    const [resendUrl, resendInit] = (fetchMock as any).mock.calls[0]
+    expect(resendUrl).toBe('https://api.resend.com/emails')
+    const resendBody = JSON.parse(resendInit.body)
+    expect(resendBody.to).toEqual(['you@example.com'])
+    expect(resendBody.bcc).toEqual(['friend@outside.com'])
+  })
+
+  test('all-local recipients across to cc bcc stay on local delivery path', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      localUsers: ['you@example.com', 'copy@example.com', 'hidden@example.com'],
+    })
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      RESEND_API_KEY: 're_test_key',
+    })
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...SEND_BODY,
+        to: ['you@example.com'],
+        cc: ['copy@example.com'],
+        bcc: ['hidden@example.com'],
+      }),
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { provider: string }
+
+    expect(response.status).toBe(200)
+    expect(json.provider).toBe('local')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   test('local group send fans out realtime conversation updates to active group members', async () => {
     const { db, chatGroupMessageIndexRows } = createRealtimeRoutingMockD1({
       localUsers: ['group@example.com'],
