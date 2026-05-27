@@ -123,6 +123,14 @@ interface PersistedInboundEmailRef {
   receivedAt: string
 }
 
+interface LocalDeliveryClassification {
+  activeLocalRecipients: string[]
+  deletedLocalRecipients: string[]
+  unresolvedLocalRecipients: string[]
+  allAreLocalDomain: boolean
+  hasExternalRecipients: boolean
+}
+
 interface IndexedGroupRealtimeMessageRef {
   groupId: string
   groupMailbox: string
@@ -176,6 +184,15 @@ export default {
               response = await handleSend(request, env, auth.mailbox, ctx)
             }
             break
+          case '/api/mailbox/delete':
+            if (request.method !== 'POST') {
+              response = Response.json({ error: 'Method not allowed' }, { status: 405 })
+            } else if (!isInternalAuthorizedRequest(request, env)) {
+              response = Response.json({ error: 'Forbidden' }, { status: 403 })
+            } else {
+              response = await handleDeleteMailbox(env, auth.mailbox)
+            }
+            break
           case '/api/sync':
             response = await handleSync(url, env, auth.mailbox)
             break
@@ -199,6 +216,9 @@ export default {
     const from = message.from
     const mailbox = normalizeMailbox(to)
     const fromAddress = normalizeMailbox(message.headers.get('from') ?? from)
+    if (await isDeletedMailbox(env, mailbox)) {
+      return
+    }
     const group = await getActiveChatGroupByMailbox(env, mailbox)
     if (group?.sync_mode === 'fast_chat') {
       console.warn(JSON.stringify({
@@ -600,12 +620,25 @@ async function handleSend(
     ...(body.cc ?? []),
     ...(body.bcc ?? []),
   ]
-  const localRecipients = await resolveLocalRecipients(env, allRecipientFields)
-  if (localRecipients && localRecipients.length === allRecipientFields.length) {
+  const localDelivery = await classifyLocalRecipients(env, allRecipientFields)
+  const deletedLocalRecipientSet = new Set(localDelivery.deletedLocalRecipients)
+  const filteredTo = filterDeletedLocalRecipients(body.to ?? [], deletedLocalRecipientSet)
+  const filteredCc = filterDeletedLocalRecipients(body.cc ?? [], deletedLocalRecipientSet)
+  const filteredBcc = filterDeletedLocalRecipients(body.bcc ?? [], deletedLocalRecipientSet)
+  const filteredRecipients = [
+    ...filteredTo,
+    ...filteredCc,
+    ...filteredBcc,
+  ]
+
+  if (localDelivery.allAreLocalDomain && localDelivery.unresolvedLocalRecipients.length === 0) {
     const normalizedAuthorizedMailbox = normalizeMailbox(authorizedMailbox)
-    const localInboundRecipients = localRecipients.filter((recipient) => recipient !== normalizedAuthorizedMailbox)
-    const primaryRecipient = body.to.length === 1 && !body.cc?.length && !body.bcc?.length
-      ? localRecipients[0] ?? null
+    const activeLocalRecipientSet = new Set(localDelivery.activeLocalRecipients)
+    const localInboundRecipients = filteredRecipients
+      .map(normalizeMailbox)
+      .filter((recipient) => activeLocalRecipientSet.has(recipient) && recipient !== normalizedAuthorizedMailbox)
+    const primaryRecipient = filteredTo.length === 1 && filteredCc.length === 0 && filteredBcc.length === 0
+      ? normalizeMailbox(filteredTo[0] ?? '')
       : null
     const messageId = crypto.randomUUID()
     const senderName = parseFromName(body.from)
@@ -679,14 +712,45 @@ async function handleSend(
     return Response.json({ id: messageId, from: body.from, provider: 'local' })
   }
 
+  if (filteredRecipients.length === 0) {
+    const messageId = crypto.randomUUID()
+    const now = new Date().toISOString()
+    await persistOutboundEmail(env, {
+      id: messageId,
+      mailbox: authorizedMailbox,
+      fromAddress: senderMailbox,
+      fromName: parseFromName(body.from),
+      toAddress: body.to.join(', '),
+      subject: body.subject,
+      bodyText: body.text,
+      bodyHtml: body.html,
+      attachmentCount: body.attachments?.length ?? 0,
+      provider: 'local',
+      receivedAt: now,
+    })
+    return Response.json({ id: messageId, from: body.from, provider: 'local' })
+  }
+
   const chain = buildProviderChain(env)
   if (chain.length === 0) {
     return Response.json({ error: 'No email provider configured' }, { status: 503 })
   }
 
+  const filteredSendReq: SendRequest = {
+    from: sendReq.from,
+    to: filteredTo,
+    subject: sendReq.subject,
+    text: sendReq.text,
+    html: sendReq.html,
+    reply_to: sendReq.reply_to,
+    cc: filteredCc.length ? filteredCc : undefined,
+    bcc: filteredBcc.length ? filteredBcc : undefined,
+    attachments: sendReq.attachments,
+  }
+
   let result: { id: string; provider: 'cloudflare' | 'resend' | 'ses' }
   try {
-    result = await sendWithChain(chain, sendReq)
+    result = await sendWithChain(chain, filteredSendReq)
   } catch (err) {
     if (err instanceof UnsupportedFeatureError) {
       return Response.json({ error: err.message }, { status: 400 })
@@ -703,7 +767,7 @@ async function handleSend(
     mailbox: authorizedMailbox,
     fromAddress: senderMailbox,
     fromName: parseFromName(body.from),
-    toAddress: body.to.join(', '),
+    toAddress: filteredTo.join(', '),
     subject: body.subject,
     bodyText: body.text,
     bodyHtml: body.html,
@@ -712,7 +776,7 @@ async function handleSend(
     receivedAt: now,
   })
 
-  const primaryRecipient = body.to.length === 1 ? normalizeMailbox(body.to[0] ?? '') : null
+  const primaryRecipient = filteredTo.length === 1 ? normalizeMailbox(filteredTo[0] ?? '') : null
   if (primaryRecipient && isRealtimeNotifyConfigured(env)) {
     const isDirectRecipient = await isDirectConversationRecipientMailbox(env, primaryRecipient)
     if (isDirectRecipient) {
@@ -733,28 +797,51 @@ async function handleSend(
   return Response.json({ id: result.id, from: body.from, provider: result.provider })
 }
 
-async function resolveLocalRecipients(env: Env, recipients: string[]): Promise<string[] | null> {
+async function classifyLocalRecipients(env: Env, recipients: string[]): Promise<LocalDeliveryClassification> {
   const normalizedRecipients = recipients.map(normalizeMailbox)
   const localDomain = getLocalDomain(env)
   if (!localDomain || normalizedRecipients.length === 0) {
-    return null
+    return {
+      activeLocalRecipients: [],
+      deletedLocalRecipients: [],
+      unresolvedLocalRecipients: [],
+      allAreLocalDomain: false,
+      hasExternalRecipients: normalizedRecipients.length > 0,
+    }
   }
 
-  if (normalizedRecipients.some((recipient) => !recipient.endsWith(`@${localDomain}`))) {
-    return null
+  const localDomainRecipients = normalizedRecipients.filter((recipient) => recipient.endsWith(`@${localDomain}`))
+  const hasExternalRecipients = localDomainRecipients.length !== normalizedRecipients.length
+  if (localDomainRecipients.length === 0) {
+    return {
+      activeLocalRecipients: [],
+      deletedLocalRecipients: [],
+      unresolvedLocalRecipients: [],
+      allAreLocalDomain: false,
+      hasExternalRecipients,
+    }
   }
 
-  const placeholders = normalizedRecipients.map(() => '?').join(', ')
+  const placeholders = localDomainRecipients.map(() => '?').join(', ')
   const rows = await env.DB.prepare(`
     SELECT mailbox FROM users WHERE mailbox IN (${placeholders}) AND status = 'active'
-  `).bind(...normalizedRecipients).all<{ mailbox: string }>()
+  `).bind(...localDomainRecipients).all<{ mailbox: string }>()
 
   const matched = new Set((rows.results ?? []).map((row) => normalizeMailbox(row.mailbox)))
-  if (matched.size !== new Set(normalizedRecipients).size) {
-    return null
-  }
+  const deleted = new Set(await listDeletedMailboxes(env, localDomainRecipients))
+  const unresolved = localDomainRecipients.filter((recipient) => !matched.has(recipient) && !deleted.has(recipient))
 
-  return normalizedRecipients
+  return {
+    activeLocalRecipients: [...matched],
+    deletedLocalRecipients: [...deleted],
+    unresolvedLocalRecipients: unresolved,
+    allAreLocalDomain: !hasExternalRecipients,
+    hasExternalRecipients,
+  }
+}
+
+function filterDeletedLocalRecipients(recipients: string[], deletedMailboxes: Set<string>): string[] {
+  return recipients.filter((recipient) => !deletedMailboxes.has(normalizeMailbox(recipient)))
 }
 
 async function persistLocalInboundEmails(
@@ -988,6 +1075,104 @@ function getLocalDomain(env: Env): string | null {
   const mailbox = env.OUTBOUND_FROM_EMAIL?.trim().toLowerCase() ?? env.MAILBOX?.trim().toLowerCase() ?? ''
   const domain = mailbox.split('@')[1] ?? ''
   return domain || null
+}
+
+async function handleDeleteMailbox(env: Env, mailbox: string): Promise<Response> {
+  const deleted = await deleteMailbox(env, mailbox, {
+    reason: 'account_delete',
+    createdBy: 'internal_api',
+  })
+  return Response.json({ ok: true, deleted })
+}
+
+async function deleteMailbox(
+  env: Env,
+  mailbox: string,
+  input: { reason: string; createdBy: string },
+): Promise<{ emails: number; attachments: number }> {
+  const normalizedMailbox = normalizeMailbox(mailbox)
+  const deletedAt = new Date().toISOString()
+  const attachmentsCount = await countRows(
+    env,
+    'SELECT COUNT(*) as count FROM attachments WHERE email_id IN (SELECT id FROM emails WHERE mailbox = ?)',
+    normalizedMailbox,
+  )
+  const emailsCount = await countRows(
+    env,
+    'SELECT COUNT(*) as count FROM emails WHERE mailbox = ?',
+    normalizedMailbox,
+  )
+
+  await env.DB.prepare(`
+    INSERT INTO deleted_mailboxes (mailbox, deleted_at, reason, created_by)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(mailbox) DO UPDATE SET
+      deleted_at = excluded.deleted_at,
+      reason = excluded.reason,
+      created_by = excluded.created_by
+  `).bind(
+    normalizedMailbox,
+    deletedAt,
+    input.reason,
+    input.createdBy,
+  ).run()
+
+  await runOptionalDelete(
+    env,
+    'DELETE FROM chat_group_message_index WHERE email_id IN (SELECT id FROM emails WHERE mailbox = ?)',
+    normalizedMailbox,
+  )
+  await env.DB.prepare(
+    'DELETE FROM attachments WHERE email_id IN (SELECT id FROM emails WHERE mailbox = ?)'
+  ).bind(normalizedMailbox).run()
+  await env.DB.prepare(
+    'DELETE FROM emails WHERE mailbox = ?'
+  ).bind(normalizedMailbox).run()
+
+  return {
+    emails: emailsCount,
+    attachments: attachmentsCount,
+  }
+}
+
+async function countRows(env: Env, sql: string, ...params: unknown[]): Promise<number> {
+  const row = await env.DB.prepare(sql).bind(...params).first<{ count: number | null }>()
+  return Number(row?.count ?? 0)
+}
+
+async function runOptionalDelete(env: Env, sql: string, ...params: unknown[]): Promise<void> {
+  try {
+    await env.DB.prepare(sql).bind(...params).run()
+  } catch (error) {
+    if (isMissingTableError(error)) {
+      return
+    }
+    throw error
+  }
+}
+
+async function isDeletedMailbox(env: Env, mailbox: string): Promise<boolean> {
+  const row = await env.DB.prepare(`
+    SELECT mailbox
+    FROM deleted_mailboxes
+    WHERE mailbox = ?
+    LIMIT 1
+  `).bind(normalizeMailbox(mailbox)).first<{ mailbox: string }>()
+  return Boolean(row?.mailbox)
+}
+
+async function listDeletedMailboxes(env: Env, mailboxes: string[]): Promise<string[]> {
+  const normalizedMailboxes = [...new Set(mailboxes.map(normalizeMailbox))]
+  if (normalizedMailboxes.length === 0) {
+    return []
+  }
+  const placeholders = normalizedMailboxes.map(() => '?').join(', ')
+  const rows = await env.DB.prepare(`
+    SELECT mailbox
+    FROM deleted_mailboxes
+    WHERE mailbox IN (${placeholders})
+  `).bind(...normalizedMailboxes).all<{ mailbox: string }>()
+  return (rows.results ?? []).map((row) => normalizeMailbox(row.mailbox))
 }
 
 async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promise<Response> {
@@ -2125,6 +2310,11 @@ function extractBearerToken(request: Request): string | null {
   return auth.slice(7)
 }
 
+function isInternalAuthorizedRequest(request: Request, env: Env): boolean {
+  const token = extractBearerToken(request)
+  return Boolean(token && env.INTERNAL_API_TOKEN && timingSafeEqual(token, env.INTERNAL_API_TOKEN))
+}
+
 function timingSafeEqual(a: string, b: string): boolean {
   const aBytes = new TextEncoder().encode(a)
   const bBytes = new TextEncoder().encode(b)
@@ -2136,6 +2326,10 @@ function timingSafeEqual(a: string, b: string): boolean {
   }
 
   return diff === 0
+}
+
+function isMissingTableError(error: unknown): boolean {
+  return String(error).toLowerCase().includes('no such table')
 }
 
 async function hashCliToken(value: string): Promise<string> {

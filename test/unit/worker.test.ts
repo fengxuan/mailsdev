@@ -149,6 +149,7 @@ function createMockD1() {
 
 interface RealtimeRoutingFixtures {
   localUsers?: string[]
+  deletedMailboxes?: string[]
   directUsersByMailbox?: Record<string, string>
   groupsByMailbox?: Record<string, { id: string; mailbox: string; sync_mode?: 'mail' | 'fast_chat' }>
   groupMembersByGroupID?: Record<string, Array<{ user_id: string; member_mailbox: string; display_name?: string | null }>>
@@ -158,6 +159,7 @@ interface RealtimeRoutingFixtures {
 function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
   const normalize = (value: unknown): string => String(value ?? '').trim().toLowerCase()
   const localUsers = new Set((fixtures.localUsers ?? []).map(normalize))
+  const deletedMailboxes = new Set((fixtures.deletedMailboxes ?? []).map(normalize))
   const directUsersByMailbox = Object.fromEntries(
     Object.entries(fixtures.directUsersByMailbox ?? {}).map(([mailbox, userID]) => [normalize(mailbox), userID]),
   )
@@ -184,6 +186,28 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
               .filter((mailbox) => localUsers.has(mailbox))
               .map((mailbox) => ({ mailbox })),
           }),
+        }
+      }
+
+      if (sql.includes('FROM deleted_mailboxes') && sql.includes('WHERE mailbox IN')) {
+        return {
+          ...defaultResult,
+          all: async () => ({
+            results: args
+              .map((arg) => normalize(arg))
+              .filter((mailbox) => deletedMailboxes.has(mailbox))
+              .map((mailbox) => ({ mailbox })),
+          }),
+        }
+      }
+
+      if (sql.includes('FROM deleted_mailboxes') && sql.includes('WHERE mailbox = ?')) {
+        return {
+          ...defaultResult,
+          first: async () => {
+            const mailbox = normalize(args[0])
+            return deletedMailboxes.has(mailbox) ? { mailbox } : null
+          },
         }
       }
 
@@ -286,6 +310,86 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
   }
 }
 
+function createMailboxDeletionMockD1(options: {
+  mailbox: string
+  emailRows?: Array<{ id: string; mailbox: string }>
+  attachmentRows?: Array<{ id: string; email_id: string }>
+}) {
+  const normalize = (value: unknown): string => String(value ?? '').trim().toLowerCase()
+  const deletedMailboxes = new Set<string>()
+  const emailRows = [...(options.emailRows ?? [])]
+  const attachmentRows = [...(options.attachmentRows ?? [])]
+  let deletedChatGroupIndexRuns = 0
+
+  const prepareMock = mock((sql: string) => ({
+    bind: (...args: unknown[]) => ({
+      run: async () => {
+        if (sql.includes('INSERT INTO deleted_mailboxes')) {
+          deletedMailboxes.add(normalize(args[0]))
+          return { success: true }
+        }
+        if (sql.includes('DELETE FROM chat_group_message_index')) {
+          deletedChatGroupIndexRuns += 1
+          return { success: true }
+        }
+        if (sql.includes('DELETE FROM attachments WHERE email_id IN')) {
+          const mailbox = normalize(args[0])
+          const emailIDs = new Set(emailRows.filter((row) => normalize(row.mailbox) === mailbox).map((row) => row.id))
+          for (let index = attachmentRows.length - 1; index >= 0; index -= 1) {
+            if (emailIDs.has(String(attachmentRows[index]!.email_id))) {
+              attachmentRows.splice(index, 1)
+            }
+          }
+          return { success: true }
+        }
+        if (sql.includes('DELETE FROM emails WHERE mailbox = ?')) {
+          const mailbox = normalize(args[0])
+          for (let index = emailRows.length - 1; index >= 0; index -= 1) {
+            if (normalize(emailRows[index]!.mailbox) === mailbox) {
+              emailRows.splice(index, 1)
+            }
+          }
+          return { success: true }
+        }
+        return { success: true }
+      },
+      all: async () => ({ results: [] as Array<Record<string, unknown>> }),
+      first: async () => {
+        if (sql.includes('SELECT COUNT(*) as count FROM attachments')) {
+          const mailbox = normalize(args[0])
+          const emailIDs = new Set(emailRows.filter((row) => normalize(row.mailbox) === mailbox).map((row) => row.id))
+          return { count: attachmentRows.filter((row) => emailIDs.has(String(row.email_id))).length }
+        }
+        if (sql.includes('SELECT COUNT(*) as count FROM emails WHERE mailbox = ?')) {
+          const mailbox = normalize(args[0])
+          return { count: emailRows.filter((row) => normalize(row.mailbox) === mailbox).length }
+        }
+        if (sql.includes('FROM deleted_mailboxes') && sql.includes('WHERE mailbox = ?')) {
+          const mailbox = normalize(args[0])
+          return deletedMailboxes.has(mailbox) ? { mailbox } : null
+        }
+        return null
+      },
+    }),
+  }))
+
+  const batchMock = mock(async (statements: Array<{ run: () => Promise<unknown> }>) => Promise.all(statements.map((statement) => statement.run())))
+  return {
+    db: {
+      prepare: prepareMock,
+      batch: batchMock,
+    } as unknown as D1Database,
+    prepareMock,
+    batchMock,
+    deletedMailboxes,
+    emailRows,
+    attachmentRows,
+    getDeletedChatGroupIndexRuns() {
+      return deletedChatGroupIndexRuns
+    },
+  }
+}
+
 function createExecutionContextHarness() {
   const pending: Promise<unknown>[] = []
   const ctx = {
@@ -355,9 +459,9 @@ describe('worker: POST /api/send', () => {
     expect(resendBody.subject).toBe('Hello')
     expect(resendBody.text).toBe('World')
 
-    // Verify D1 insert was called after the local-recipient lookup
-    expect(prepareMock).toHaveBeenCalledTimes(2)
-    expect(bindMock).toHaveBeenCalledTimes(2)
+    // Verify D1 insert was called after the local-recipient and deleted-mailbox lookups
+    expect(prepareMock).toHaveBeenCalledTimes(3)
+    expect(bindMock).toHaveBeenCalledTimes(3)
     const boundArgs = (bindMock as any).mock.calls.at(-1)
     expect(boundArgs[0]).toBe('resend-id-123') // id
     expect(boundArgs[1]).toBe('me@example.com') // mailbox
@@ -1094,6 +1198,121 @@ describe('worker: POST /api/send', () => {
 
     expect(response.status).toBe(403)
     expect(json.error).toBe('Forbidden')
+  })
+})
+
+describe('worker: mailbox deletion', () => {
+  test('internal mailbox delete removes inbox data and marks mailbox deleted', async () => {
+    const { db, deletedMailboxes, emailRows, attachmentRows, getDeletedChatGroupIndexRuns } = createMailboxDeletionMockD1({
+      mailbox: 'user@example.com',
+      emailRows: [
+        { id: 'email-1', mailbox: 'user@example.com' },
+        { id: 'email-2', mailbox: 'user@example.com' },
+        { id: 'email-3', mailbox: 'other@example.com' },
+      ],
+      attachmentRows: [
+        { id: 'att-1', email_id: 'email-1' },
+        { id: 'att-2', email_id: 'email-2' },
+        { id: 'att-3', email_id: 'email-3' },
+      ],
+    })
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+    } as Env
+
+    const request = new Request('http://localhost/api/mailbox/delete', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer internal-token',
+        'X-Mailbox': 'user@example.com',
+      },
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { ok: boolean; deleted: { emails: number; attachments: number } }
+
+    expect(response.status).toBe(200)
+    expect(json).toEqual({
+      ok: true,
+      deleted: {
+        emails: 2,
+        attachments: 2,
+      },
+    })
+    expect(deletedMailboxes.has('user@example.com')).toBe(true)
+    expect(emailRows).toEqual([{ id: 'email-3', mailbox: 'other@example.com' }])
+    expect(attachmentRows).toEqual([{ id: 'att-3', email_id: 'email-3' }])
+    expect(getDeletedChatGroupIndexRuns()).toBe(1)
+  })
+
+  test('mailbox delete requires internal auth', async () => {
+    const { db } = createMailboxDeletionMockD1({
+      mailbox: 'user@example.com',
+    })
+    const env = singleMailboxEnv('user@example.com', {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+    })
+
+    const request = authedRequest('http://localhost/api/mailbox/delete', {
+      method: 'POST',
+      headers: {
+        'X-Mailbox': 'user@example.com',
+      },
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { error: string }
+
+    expect(response.status).toBe(403)
+    expect(json.error).toBe('Forbidden')
+  })
+
+  test('deleted mailbox drops future inbound email and local delivery', async () => {
+    const { db, prepareMock } = createRealtimeRoutingMockD1({
+      deletedMailboxes: ['deleted@example.com'],
+    })
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      OUTBOUND_FROM_EMAIL: 'chat@example.com',
+    })
+
+    const inboundMessage = makeForwardableEmailMessage({
+      to: 'deleted@example.com',
+      from: 'sender@example.com',
+      subject: 'Hello',
+      bodyText: 'World',
+    })
+
+    await worker.email(inboundMessage, env)
+
+    const inboxInsertSql = (prepareMock as any).mock.calls.find(([sql]: [string]) =>
+      String(sql).includes('INSERT INTO emails')
+    )
+    expect(inboxInsertSql).toBeUndefined()
+
+    const sendRequest = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        from: 'me@example.com',
+        to: ['deleted@example.com'],
+        subject: 'Hi deleted',
+        text: 'Still stored outbound only',
+      }),
+    })
+
+    const response = await worker.fetch(sendRequest, env)
+    const json = await response.json() as { provider: string }
+
+    expect(response.status).toBe(200)
+    expect(json.provider).toBe('local')
+
+    const insertCalls = (prepareMock as any).mock.calls
+      .map(([sql]: [string]) => String(sql))
+      .filter((sql) => sql.includes('INSERT INTO emails'))
+    expect(insertCalls).toHaveLength(1)
   })
 })
 

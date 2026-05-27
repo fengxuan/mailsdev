@@ -134,6 +134,13 @@ CREATE TABLE IF NOT EXISTS apns_device_registrations (
   FOREIGN KEY (user_id) REFERENCES users(id)
 );
 
+CREATE TABLE IF NOT EXISTS deleted_mailboxes (
+  mailbox TEXT PRIMARY KEY,
+  deleted_at TEXT NOT NULL,
+  reason TEXT,
+  created_by TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_emails_mailbox ON emails(mailbox, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_emails_peer ON emails(mailbox, peer_address, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_emails_code ON emails(mailbox) WHERE code IS NOT NULL;
