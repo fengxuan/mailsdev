@@ -3,6 +3,7 @@ dist/
 *.tgz
 .env
 .env.local
+worker/.dev.vars
 .DS_Store
 test/.test-*
 test/.oss-sync-test.db*
@@ -11,4 +12,3 @@ docs/bugs-*.md
 worker/.wrangler/
 deploy/
 .wrangler
-
