@@ -14,8 +14,7 @@ export interface Env {
   DB: D1Database
   /** Single-mailbox token. Requires MAILBOX to be set. */
   AUTH_TOKEN?: string
-  /** Shared with mails-chat-api for direct-user mailbox access-token verification. */
-  AUTH_SECRET?: string
+  ACCESS_TOKEN_SECRET?: string
   /** Single mailbox address associated with AUTH_TOKEN. */
   MAILBOX?: string
   /** Optional multi-mailbox token map as JSON: {"mailbox@example.com":"token"} */
@@ -170,7 +169,7 @@ export default {
     if (url.pathname === '/health') {
       response = Response.json({ ok: true })
     } else if (url.pathname.startsWith('/api/')) {
-      const auth = await requireAuthorizedMailbox(request, env)
+      const auth = await requirePublicAuthorizedMailbox(request, env)
       if ('response' in auth) {
         response = auth.response
       } else {
@@ -194,16 +193,46 @@ export default {
               response = await handleSend(request, env, auth.mailbox, ctx)
             }
             break
-          case '/api/mailbox/delete':
+          case '/api/sync':
+            response = await handleSync(url, env, auth.mailbox)
+            break
+          default:
+            response = Response.json({ error: 'Not found' }, { status: 404 })
+        }
+      }
+    } else if (url.pathname.startsWith('/internal/')) {
+      const auth = await requireInternalAuthorizedMailbox(request, env)
+      if ('response' in auth) {
+        response = auth.response
+      } else {
+        switch (url.pathname) {
+          case '/internal/inbox':
+            response = await handleInbox(url, env, auth.mailbox)
+            break
+          case '/internal/code':
+            response = await handleGetCode(url, env, auth.mailbox)
+            break
+          case '/internal/email':
+            response = await handleGetEmail(url, env, auth.mailbox)
+            break
+          case '/internal/conversations':
+            response = await handleConversations(url, env, auth.mailbox)
+            break
+          case '/internal/send':
             if (request.method !== 'POST') {
               response = Response.json({ error: 'Method not allowed' }, { status: 405 })
-            } else if (!isInternalAuthorizedRequest(request, env)) {
-              response = Response.json({ error: 'Forbidden' }, { status: 403 })
+            } else {
+              response = await handleSend(request, env, auth.mailbox, ctx)
+            }
+            break
+          case '/internal/mailbox/delete':
+            if (request.method !== 'POST') {
+              response = Response.json({ error: 'Method not allowed' }, { status: 405 })
             } else {
               response = await handleDeleteMailbox(env, auth.mailbox)
             }
             break
-          case '/api/sync':
+          case '/internal/sync':
             response = await handleSync(url, env, auth.mailbox)
             break
           default:
@@ -2326,11 +2355,6 @@ function extractBearerValue(value: string | null): string | null {
   return token || null
 }
 
-function isInternalAuthorizedRequest(request: Request, env: Env): boolean {
-  const token = extractBearerToken(request)
-  return Boolean(token && env.INTERNAL_API_TOKEN && timingSafeEqual(token, env.INTERNAL_API_TOKEN))
-}
-
 function timingSafeEqual(a: string, b: string): boolean {
   const aBytes = new TextEncoder().encode(a)
   const bBytes = new TextEncoder().encode(b)
@@ -2354,10 +2378,10 @@ async function hashCliToken(value: string): Promise<string> {
   return bytesToHex(new Uint8Array(digest))
 }
 
-function requireAuthSecret(env: Env): string {
-  const secret = env.AUTH_SECRET?.trim()
+function requireAccessTokenSecret(env: Env): string {
+  const secret = env.ACCESS_TOKEN_SECRET?.trim()
   if (!secret) {
-    throw new Error('AUTH_SECRET is not configured')
+    throw new Error('ACCESS_TOKEN_SECRET is not configured')
   }
   return secret
 }
@@ -2368,7 +2392,7 @@ async function verifyAccessToken(env: Env, token: string): Promise<AccessTokenCl
     throw new Error('invalid_access_token')
   }
 
-  const expected = await hmacSha256(requireAuthSecret(env), `${encodedHeader}.${encodedPayload}`)
+  const expected = await hmacSha256(requireAccessTokenSecret(env), `${encodedHeader}.${encodedPayload}`)
   const actual = base64UrlDecodeToBytes(encodedSignature)
   if (!timingSafeEqualBytes(actual, expected)) {
     throw new Error('invalid_access_token')
@@ -2442,7 +2466,9 @@ function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
-function getMailboxTokens(env: Env): { tokens?: Map<string, string>; response?: Response } {
+function getMailboxTokens(
+  env: Env,
+): { tokens: Map<string, string> } | { missingConfig: true } | { response: Response } {
   const tokens = new Map<string, string>()
 
   if (env.AUTH_TOKENS_JSON) {
@@ -2467,45 +2493,33 @@ function getMailboxTokens(env: Env): { tokens?: Map<string, string>; response?: 
   }
 
   if (tokens.size === 0) {
-    return { response: Response.json({ error: 'AUTH_TOKEN not configured' }, { status: 503 }) }
+    return { missingConfig: true }
   }
 
   return { tokens }
 }
 
-async function requireAuthorizedMailbox(request: Request, env: Env): Promise<{ mailbox: string } | { response: Response }> {
+async function requirePublicAuthorizedMailbox(request: Request, env: Env): Promise<{ mailbox: string } | { response: Response }> {
   const token = extractBearerToken(request)
   if (!token) {
     return { response: Response.json({ error: 'Unauthorized' }, { status: 401 }) }
   }
 
-  if (env.INTERNAL_API_TOKEN && timingSafeEqual(token, env.INTERNAL_API_TOKEN)) {
-    const mailbox = normalizeMailbox(request.headers.get('X-Mailbox') ?? '')
-    if (!mailbox || !isValidEmail(mailbox)) {
-      return { response: Response.json({ error: 'X-Mailbox is required' }, { status: 400 }) }
-    }
-    const internalReadResponse = await authorizeInternalReadMailbox(request, env, mailbox)
-    if (internalReadResponse) {
-      return { response: internalReadResponse }
-    }
-    return { mailbox }
-  }
-
   const configured = getMailboxTokens(env)
-  if (configured.response) return { response: configured.response }
-
-  let matchedMailbox: string | null = null
-  for (const [mailbox, expectedToken] of configured.tokens!) {
-    if (timingSafeEqual(token, expectedToken)) {
-      if (matchedMailbox) {
-        return { response: Response.json({ error: 'Duplicate mailbox tokens are not allowed' }, { status: 503 }) }
+  if ('tokens' in configured) {
+    let matchedMailbox: string | null = null
+    for (const [mailbox, expectedToken] of configured.tokens) {
+      if (timingSafeEqual(token, expectedToken)) {
+        if (matchedMailbox) {
+          return { response: Response.json({ error: 'Duplicate mailbox tokens are not allowed' }, { status: 503 }) }
+        }
+        matchedMailbox = mailbox
       }
-      matchedMailbox = mailbox
     }
-  }
 
-  if (matchedMailbox) {
-    return { mailbox: matchedMailbox }
+    if (matchedMailbox) {
+      return { mailbox: matchedMailbox }
+    }
   }
 
   const cliTokenMailbox = await findAuthorizedMailboxByCliToken(env, token)
@@ -2513,7 +2527,33 @@ async function requireAuthorizedMailbox(request: Request, env: Env): Promise<{ m
     return { mailbox: cliTokenMailbox }
   }
 
+  if ('response' in configured) {
+    return { response: configured.response }
+  }
+  if ('missingConfig' in configured) {
+    return { response: Response.json({ error: 'AUTH_TOKEN not configured' }, { status: 503 }) }
+  }
+
   return { response: Response.json({ error: 'Unauthorized' }, { status: 401 }) }
+}
+
+async function requireInternalAuthorizedMailbox(request: Request, env: Env): Promise<{ mailbox: string } | { response: Response }> {
+  const token = extractBearerToken(request)
+  if (!token || !env.INTERNAL_API_TOKEN || !timingSafeEqual(token, env.INTERNAL_API_TOKEN)) {
+    return { response: Response.json({ error: 'Forbidden' }, { status: 403 }) }
+  }
+
+  const mailbox = normalizeMailbox(request.headers.get('X-Mailbox') ?? '')
+  if (!mailbox || !isValidEmail(mailbox)) {
+    return { response: Response.json({ error: 'X-Mailbox is required' }, { status: 400 }) }
+  }
+
+  const internalReadResponse = await authorizeInternalReadMailbox(request, env, mailbox)
+  if (internalReadResponse) {
+    return { response: internalReadResponse }
+  }
+
+  return { mailbox }
 }
 
 async function authorizeInternalReadMailbox(request: Request, env: Env, mailbox: string): Promise<Response | null> {
@@ -2549,11 +2589,11 @@ async function authorizeInternalReadMailbox(request: Request, env: Env, mailbox:
 }
 
 function isInternalReadMailboxPath(pathname: string): boolean {
-  return pathname === '/api/inbox'
-    || pathname === '/api/code'
-    || pathname === '/api/email'
-    || pathname === '/api/conversations'
-    || pathname === '/api/sync'
+  return pathname === '/internal/inbox'
+    || pathname === '/internal/code'
+    || pathname === '/internal/email'
+    || pathname === '/internal/conversations'
+    || pathname === '/internal/sync'
 }
 
 function isChatGroupCommandMailbox(mailbox: string): boolean {

@@ -134,6 +134,22 @@ npm --prefix worker run mails:cli-login -- --email you@example.com
 # and clears any old hosted api_key/token from ~/.mails/config.json
 ```
 
+When this self-hosted worker is paired with the rest of the Mails Chat stack, also configure these shared secrets in `worker/.dev.vars` or production Worker secrets:
+
+- `INTERNAL_API_TOKEN`
+  - must match `mails-chat-api` `INTERNAL_API_TOKEN`
+- `AUTH_TOKEN`
+  - must match `mails-blog` `BLOG_SUBSCRIPTION_SEND_TOKEN` when blog subscription emails are sent through this worker mailbox
+- `ACCESS_TOKEN_SECRET`
+  - must match `mails-chat-api`, `mails-blog`, and `mails-realtime-notify` for direct-user mailbox access verification
+  - used for `mails-chat-api` -> `mailsdev/worker /internal/*`
+- `ACCESS_TOKEN_SECRET`
+  - must match `mails-chat-api`, `mails-realtime-notify`, and `mails-blog`
+  - used when worker verifies `X-User-Authorization` for direct-user internal mailbox reads
+- `REALTIME_INTERNAL_TOKEN`
+  - must match `mails-chat-api` and `mails-realtime-notify`
+  - used when worker emits `/internal/notify*` events
+
 ## CLI Reference
 
 ### claim

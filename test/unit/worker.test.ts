@@ -1243,7 +1243,7 @@ describe('worker: mailbox deletion', () => {
       INTERNAL_API_TOKEN: 'internal-token',
     } as Env
 
-    const request = new Request('http://localhost/api/mailbox/delete', {
+    const request = new Request('http://localhost/internal/mailbox/delete', {
       method: 'POST',
       headers: {
         Authorization: 'Bearer internal-token',
@@ -1277,7 +1277,7 @@ describe('worker: mailbox deletion', () => {
       INTERNAL_API_TOKEN: 'internal-token',
     })
 
-    const request = authedRequest('http://localhost/api/mailbox/delete', {
+    const request = authedRequest('http://localhost/internal/mailbox/delete', {
       method: 'POST',
       headers: {
         'X-Mailbox': 'user@example.com',
@@ -1949,10 +1949,10 @@ describe('worker: GET /api/inbox and /api/code', () => {
     const env = {
       DB: db,
       INTERNAL_API_TOKEN: 'internal-token',
-      AUTH_SECRET: 'test-auth-secret',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
     } as Env
 
-    const request = new Request('http://localhost/api/code?to=user@test.com&timeout=1', {
+    const request = new Request('http://localhost/internal/code?to=user@test.com&timeout=1', {
       headers: {
         Authorization: 'Bearer internal-token',
         'X-Mailbox': 'user@test.com',
@@ -1999,10 +1999,10 @@ describe('worker: GET /api/inbox and /api/code', () => {
     const env = {
       DB: db,
       INTERNAL_API_TOKEN: 'internal-token',
-      AUTH_SECRET: 'test-auth-secret',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
     } as Env
 
-    const request = new Request('http://localhost/api/code?to=user@test.com&timeout=1', {
+    const request = new Request('http://localhost/internal/code?to=user@test.com&timeout=1', {
       headers: {
         Authorization: 'Bearer internal-token',
         'X-Mailbox': 'user@test.com',
@@ -2019,6 +2019,37 @@ describe('worker: GET /api/inbox and /api/code', () => {
 
     expect(response.status).toBe(200)
     expect(json.code).toBe('114669')
+  })
+
+  test('public mailbox routes do not accept the internal token', async () => {
+    const db = {
+      prepare: mock(() => ({
+        bind: mock(() => ({
+          first: mock(() => Promise.resolve(null)),
+          all: mock(() => Promise.resolve({ results: [] })),
+          run: mock(() => Promise.resolve({ success: true })),
+        })),
+      })),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      AUTH_TOKEN: 'public-token',
+      MAILBOX: 'user@test.com',
+      INTERNAL_API_TOKEN: 'internal-token',
+    } as Env
+
+    const request = new Request('http://localhost/api/code?to=user@test.com&timeout=1', {
+      headers: {
+        Authorization: 'Bearer internal-token',
+      },
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { error: string }
+
+    expect(response.status).toBe(401)
+    expect(json.error).toBe('Unauthorized')
   })
 })
 
