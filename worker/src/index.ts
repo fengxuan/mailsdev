@@ -14,6 +14,8 @@ export interface Env {
   DB: D1Database
   /** Single-mailbox token. Requires MAILBOX to be set. */
   AUTH_TOKEN?: string
+  /** Shared with mails-chat-api for direct-user mailbox access-token verification. */
+  AUTH_SECRET?: string
   /** Single mailbox address associated with AUTH_TOKEN. */
   MAILBOX?: string
   /** Optional multi-mailbox token map as JSON: {"mailbox@example.com":"token"} */
@@ -54,6 +56,14 @@ interface CliTokenAuthRow {
   expires_at: string
   revoked_at: string | null
   user_status: 'pending' | 'active' | 'disabled'
+}
+
+interface AccessTokenClaims {
+  sub: string
+  email: string
+  mailbox: string
+  iat: number
+  exp: number
 }
 
 interface ConversationSummaryRow {
@@ -2310,6 +2320,12 @@ function extractBearerToken(request: Request): string | null {
   return auth.slice(7)
 }
 
+function extractBearerValue(value: string | null): string | null {
+  if (!value?.startsWith('Bearer ')) return null
+  const token = value.slice(7).trim()
+  return token || null
+}
+
 function isInternalAuthorizedRequest(request: Request, env: Env): boolean {
   const token = extractBearerToken(request)
   return Boolean(token && env.INTERNAL_API_TOKEN && timingSafeEqual(token, env.INTERNAL_API_TOKEN))
@@ -2336,6 +2352,90 @@ async function hashCliToken(value: string): Promise<string> {
   const bytes = new TextEncoder().encode(`cli_token:${value}`)
   const digest = await crypto.subtle.digest('SHA-256', bytes)
   return bytesToHex(new Uint8Array(digest))
+}
+
+function requireAuthSecret(env: Env): string {
+  const secret = env.AUTH_SECRET?.trim()
+  if (!secret) {
+    throw new Error('AUTH_SECRET is not configured')
+  }
+  return secret
+}
+
+async function verifyAccessToken(env: Env, token: string): Promise<AccessTokenClaims> {
+  const [encodedHeader, encodedPayload, encodedSignature] = token.split('.')
+  if (!encodedHeader || !encodedPayload || !encodedSignature) {
+    throw new Error('invalid_access_token')
+  }
+
+  const expected = await hmacSha256(requireAuthSecret(env), `${encodedHeader}.${encodedPayload}`)
+  const actual = base64UrlDecodeToBytes(encodedSignature)
+  if (!timingSafeEqualBytes(actual, expected)) {
+    throw new Error('invalid_access_token')
+  }
+
+  let claims: AccessTokenClaims
+  try {
+    claims = JSON.parse(base64UrlDecode(encodedPayload)) as AccessTokenClaims
+  } catch {
+    throw new Error('invalid_access_token')
+  }
+
+  if (
+    typeof claims.sub !== 'string' ||
+    typeof claims.email !== 'string' ||
+    typeof claims.mailbox !== 'string' ||
+    typeof claims.iat !== 'number' ||
+    typeof claims.exp !== 'number'
+  ) {
+    throw new Error('invalid_access_token')
+  }
+
+  if (claims.exp <= Math.floor(Date.now() / 1000)) {
+    throw new Error('access_token_expired')
+  }
+
+  return claims
+}
+
+async function hmacSha256(secret: string, value: string): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(value))
+  return new Uint8Array(signature)
+}
+
+function base64UrlDecode(value: string): string {
+  return new TextDecoder().decode(base64UrlDecodeToBytes(value))
+}
+
+function base64UrlDecodeToBytes(value: string): Uint8Array {
+  const base64 = value
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+    .padEnd(Math.ceil(value.length / 4) * 4, '=')
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index)
+  }
+  return bytes
+}
+
+function timingSafeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
+  const length = Math.max(a.length, b.length)
+  let diff = a.length ^ b.length
+
+  for (let index = 0; index < length; index += 1) {
+    diff |= (a[index] ?? 0) ^ (b[index] ?? 0)
+  }
+
+  return diff === 0
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -2384,6 +2484,10 @@ async function requireAuthorizedMailbox(request: Request, env: Env): Promise<{ m
     if (!mailbox || !isValidEmail(mailbox)) {
       return { response: Response.json({ error: 'X-Mailbox is required' }, { status: 400 }) }
     }
+    const internalReadResponse = await authorizeInternalReadMailbox(request, env, mailbox)
+    if (internalReadResponse) {
+      return { response: internalReadResponse }
+    }
     return { mailbox }
   }
 
@@ -2410,6 +2514,50 @@ async function requireAuthorizedMailbox(request: Request, env: Env): Promise<{ m
   }
 
   return { response: Response.json({ error: 'Unauthorized' }, { status: 401 }) }
+}
+
+async function authorizeInternalReadMailbox(request: Request, env: Env, mailbox: string): Promise<Response | null> {
+  const pathname = new URL(request.url).pathname
+  if (!isInternalReadMailboxPath(pathname)) {
+    return null
+  }
+
+  if (isChatGroupCommandMailbox(mailbox)) {
+    return null
+  }
+
+  const directUserId = await findActiveDirectUserIdByMailbox(env, mailbox)
+  if (!directUserId) {
+    return null
+  }
+
+  const userToken = extractBearerValue(request.headers.get('X-User-Authorization'))
+  if (!userToken) {
+    return Response.json({ error: 'Forbidden' }, { status: 403 })
+  }
+
+  try {
+    const claims = await verifyAccessToken(env, userToken)
+    if (claims.sub !== directUserId || normalizeMailbox(claims.mailbox) !== mailbox) {
+      return Response.json({ error: 'Forbidden' }, { status: 403 })
+    }
+  } catch {
+    return Response.json({ error: 'Forbidden' }, { status: 403 })
+  }
+
+  return null
+}
+
+function isInternalReadMailboxPath(pathname: string): boolean {
+  return pathname === '/api/inbox'
+    || pathname === '/api/code'
+    || pathname === '/api/email'
+    || pathname === '/api/conversations'
+    || pathname === '/api/sync'
+}
+
+function isChatGroupCommandMailbox(mailbox: string): boolean {
+  return normalizeMailbox(mailbox).startsWith('admin_command@')
 }
 
 async function findAuthorizedMailboxByCliToken(env: Env, token: string): Promise<string | null> {

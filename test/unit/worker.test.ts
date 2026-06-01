@@ -2,6 +2,7 @@ import { describe, expect, test, mock, beforeEach, afterEach } from 'bun:test'
 import { parseIncomingEmail } from '../../worker/src/mime'
 import type { Env } from '../../worker/src/index'
 import worker from '../../worker/src/index'
+import { createHmac } from 'node:crypto'
 
 const DEFAULT_AUTH_TOKEN = 'unit_test_auth_token'
 
@@ -20,6 +21,27 @@ function authedRequest(input: string, init: RequestInit = {}, token = DEFAULT_AU
   const headers = new Headers(init.headers)
   headers.set('Authorization', `Bearer ${token}`)
   return new Request(input, { ...init, headers })
+}
+
+function createAccessToken(
+  claims: { sub: string; email: string; mailbox: string; iat?: number; exp?: number },
+  secret = 'test-auth-secret',
+): string {
+  const now = Math.floor(Date.now() / 1000)
+  const payload = {
+    sub: claims.sub,
+    email: claims.email,
+    mailbox: claims.mailbox,
+    iat: claims.iat ?? now,
+    exp: claims.exp ?? now + 3600,
+  }
+  const encodedHeader = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url')
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64url')
+  const signature = createHmac('sha256', secret)
+    .update(`${encodedHeader}.${encodedPayload}`)
+    .digest()
+    .toString('base64url')
+  return `${encodedHeader}.${encodedPayload}.${signature}`
 }
 
 describe('worker: MIME parsing', () => {
@@ -1902,6 +1924,101 @@ describe('worker: GET /api/inbox and /api/code', () => {
 
     expect(response.status).toBe(403)
     expect(json.error).toBe('Forbidden')
+  })
+
+  test('rejects internal token from polling a direct-user mailbox without matching user access token', async () => {
+    const db = {
+      prepare: mock((sql: string) => ({
+        bind: mock((...args: unknown[]) => {
+          if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+            return {
+              first: mock(() => Promise.resolve({ id: 'user-1' })),
+              all: mock(() => Promise.resolve({ results: [] })),
+              run: mock(() => Promise.resolve({ success: true })),
+            }
+          }
+          return {
+            first: mock(() => Promise.resolve(null)),
+            all: mock(() => Promise.resolve({ results: [] })),
+            run: mock(() => Promise.resolve({ success: true })),
+          }
+        }),
+      })),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      AUTH_SECRET: 'test-auth-secret',
+    } as Env
+
+    const request = new Request('http://localhost/api/code?to=user@test.com&timeout=1', {
+      headers: {
+        Authorization: 'Bearer internal-token',
+        'X-Mailbox': 'user@test.com',
+      },
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { error: string }
+
+    expect(response.status).toBe(403)
+    expect(json.error).toBe('Forbidden')
+  })
+
+  test('allows internal token to read a direct-user mailbox only with the matching user access token', async () => {
+    const db = {
+      prepare: mock((sql: string) => ({
+        bind: mock((...args: unknown[]) => {
+          if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+            return {
+              first: mock(() => Promise.resolve({ id: 'user-1' })),
+              all: mock(() => Promise.resolve({ results: [] })),
+              run: mock(() => Promise.resolve({ success: true })),
+            }
+          }
+          return {
+            first: mock(() => Promise.resolve(null)),
+            all: mock(() => Promise.resolve({
+              results: [{
+                id: 'sync-e1',
+                from_address: 'sender@test.com',
+                subject: 'OTP Code',
+                body_text: 'Your verification code is 114669',
+                body_html: '',
+                code: null,
+                received_at: '2026-03-19T10:00:00Z',
+              }],
+            })),
+            run: mock(() => Promise.resolve({ success: true })),
+          }
+        }),
+      })),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      AUTH_SECRET: 'test-auth-secret',
+    } as Env
+
+    const request = new Request('http://localhost/api/code?to=user@test.com&timeout=1', {
+      headers: {
+        Authorization: 'Bearer internal-token',
+        'X-Mailbox': 'user@test.com',
+        'X-User-Authorization': `Bearer ${createAccessToken({
+          sub: 'user-1',
+          email: 'user@test.com',
+          mailbox: 'user@test.com',
+        })}`,
+      },
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { code: string | null }
+
+    expect(response.status).toBe(200)
+    expect(json.code).toBe('114669')
   })
 })
 

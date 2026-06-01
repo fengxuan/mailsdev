@@ -9,6 +9,10 @@ AUTH_TOKEN=replace_me_for_agent_example_com
 # mails-blog BLOG_CHAT_API_INTERNAL_TOKEN.
 INTERNAL_API_TOKEN=replace_me_shared_with_mails_chat_api_and_mails_blog
 
+# Shared with mails-chat-api AUTH_SECRET so internal mailbox reads can verify
+# the logged-in user's access token for direct-user mailboxes.
+AUTH_SECRET=replace_me_shared_with_mails_chat_api_auth_secret
+
 # Optional outbound email provider key for real send API usage.
 RESEND_API_KEY=re_optional_if_you_want_send_api
 
