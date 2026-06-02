@@ -707,16 +707,28 @@ async function handleSend(
         replyTo: body.reply_to,
       })
       for (const email of persistedInboundEmails) {
-        const indexedGroupMessage = await maybeUpsertChatGroupMessageIndex(env, {
-          emailId: email.id,
-          mailbox: email.mailbox,
-          senderMailbox,
-          senderName,
-          bodyText: body.text,
-          bodyHtml: body.html,
-          provider: 'local',
-          receivedAt: email.receivedAt,
-        })
+        let indexedGroupMessage: IndexedGroupRealtimeMessageRef | null = null
+        try {
+          indexedGroupMessage = await maybeUpsertChatGroupMessageIndex(env, {
+            emailId: email.id,
+            mailbox: email.mailbox,
+            senderMailbox,
+            senderName,
+            bodyText: body.text,
+            bodyHtml: body.html,
+            provider: 'local',
+            receivedAt: email.receivedAt,
+          })
+        } catch (error) {
+          console.warn(JSON.stringify({
+            event: 'local_inbound_group_index_failed',
+            source: 'mails-worker',
+            mailbox: email.mailbox,
+            sender_mailbox: senderMailbox,
+            email_id: email.id,
+            error: error instanceof Error ? error.message : String(error),
+          }))
+        }
         scheduleRealtimeNotifyForIncomingMailbox(env, ctx, {
           mailbox: email.mailbox,
           senderMailbox,
@@ -732,19 +744,30 @@ async function handleSend(
     }
 
     if (primaryRecipient && isRealtimeNotifyConfigured(env)) {
-      const isDirectRecipient = await isDirectConversationRecipientMailbox(env, primaryRecipient)
-      if (isDirectRecipient) {
-        scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
-          senderMailbox,
-          senderName,
-          bodyText: body.text,
-          bodyHtml: body.html,
-          emailId: messageId,
-          receivedAt: outboundReceivedAt,
-          peerMailbox: primaryRecipient,
-          source: 'send_direct_outbound',
-          status: 'sent',
-        })
+      try {
+        const isDirectRecipient = await isDirectConversationRecipientMailbox(env, primaryRecipient)
+        if (isDirectRecipient) {
+          scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
+            senderMailbox,
+            senderName,
+            bodyText: body.text,
+            bodyHtml: body.html,
+            emailId: messageId,
+            receivedAt: outboundReceivedAt,
+            peerMailbox: primaryRecipient,
+            source: 'send_direct_outbound',
+            status: 'sent',
+          })
+        }
+      } catch (error) {
+        console.warn(JSON.stringify({
+          event: 'direct_outbound_realtime_prepare_failed',
+          source: 'mails-worker',
+          mailbox: normalizeMailbox(authorizedMailbox),
+          peer: primaryRecipient,
+          email_id: messageId,
+          error: error instanceof Error ? error.message : String(error),
+        }))
       }
     }
 
@@ -817,19 +840,30 @@ async function handleSend(
 
   const primaryRecipient = filteredTo.length === 1 ? normalizeMailbox(filteredTo[0] ?? '') : null
   if (primaryRecipient && isRealtimeNotifyConfigured(env)) {
-    const isDirectRecipient = await isDirectConversationRecipientMailbox(env, primaryRecipient)
-    if (isDirectRecipient) {
-      scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
-        senderMailbox,
-        senderName: parseFromName(body.from),
-        bodyText: body.text,
-        bodyHtml: body.html,
-        emailId: result.id,
-        receivedAt: now,
-        peerMailbox: primaryRecipient,
-        source: 'send_direct_outbound',
-        status: 'sent',
-      })
+    try {
+      const isDirectRecipient = await isDirectConversationRecipientMailbox(env, primaryRecipient)
+      if (isDirectRecipient) {
+        scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
+          senderMailbox,
+          senderName: parseFromName(body.from),
+          bodyText: body.text,
+          bodyHtml: body.html,
+          emailId: result.id,
+          receivedAt: now,
+          peerMailbox: primaryRecipient,
+          source: 'send_direct_outbound',
+          status: 'sent',
+        })
+      }
+    } catch (error) {
+      console.warn(JSON.stringify({
+        event: 'direct_outbound_realtime_prepare_failed',
+        source: 'mails-worker',
+        mailbox: normalizeMailbox(authorizedMailbox),
+        peer: primaryRecipient,
+        email_id: result.id,
+        error: error instanceof Error ? error.message : String(error),
+      }))
     }
   }
 
