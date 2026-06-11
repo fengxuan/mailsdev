@@ -624,6 +624,7 @@ async function handleSend(
     text?: string
     html?: string
     reply_to?: string
+    headers?: Record<string, string>
     cc?: string[]
     bcc?: string[]
     attachments?: Array<{ filename: string; content: string; content_type?: string }>
@@ -649,6 +650,7 @@ async function handleSend(
     text: body.text,
     html: body.html,
     reply_to: body.reply_to,
+    headers: body.headers,
     cc: body.cc,
     bcc: body.bcc,
     attachments: body.attachments,
@@ -691,6 +693,8 @@ async function handleSend(
       subject: body.subject,
       bodyText: body.text,
       bodyHtml: body.html,
+      headers: body.headers,
+      messageId: headerMessageID(body.headers),
       attachmentCount: body.attachments?.length ?? 0,
       provider: 'local',
       receivedAt: outboundReceivedAt,
@@ -786,6 +790,8 @@ async function handleSend(
       subject: body.subject,
       bodyText: body.text,
       bodyHtml: body.html,
+      headers: body.headers,
+      messageId: headerMessageID(body.headers),
       attachmentCount: body.attachments?.length ?? 0,
       provider: 'local',
       receivedAt: now,
@@ -805,6 +811,7 @@ async function handleSend(
     text: sendReq.text,
     html: sendReq.html,
     reply_to: sendReq.reply_to,
+    headers: sendReq.headers,
     cc: filteredCc.length ? filteredCc : undefined,
     bcc: filteredBcc.length ? filteredBcc : undefined,
     attachments: sendReq.attachments,
@@ -833,6 +840,8 @@ async function handleSend(
     subject: body.subject,
     bodyText: body.text,
     bodyHtml: body.html,
+    headers: body.headers,
+    messageId: headerMessageID(body.headers),
     attachmentCount: body.attachments?.length ?? 0,
     provider: result.provider,
     receivedAt: now,
@@ -974,6 +983,8 @@ async function persistOutboundEmail(
     subject: string
     bodyText?: string
     bodyHtml?: string
+    headers?: Record<string, string>
+    messageId?: string | null
     attachmentCount: number
     provider: 'cloudflare' | 'resend' | 'ses' | 'local'
     receivedAt: string
@@ -985,7 +996,7 @@ async function persistOutboundEmail(
       body_text, body_html, code, headers, metadata, message_id,
       has_attachments, attachment_count, attachment_names, attachment_search_text,
       raw_storage_key, direction, status, provider, received_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}', '{}', NULL, ?, ?, '', '', NULL, 'outbound', 'sent', ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, '{}', ?, ?, ?, '', '', NULL, 'outbound', 'sent', ?, ?, ?)
   `).bind(
     input.id,
     input.mailbox,
@@ -996,12 +1007,25 @@ async function persistOutboundEmail(
     input.subject,
     (input.bodyText ?? '').slice(0, 50000),
     (input.bodyHtml ?? '').slice(0, 100000),
+    JSON.stringify(input.headers ?? {}),
+    input.messageId ?? null,
     input.attachmentCount > 0 ? 1 : 0,
     input.attachmentCount,
     input.provider,
     input.receivedAt,
     input.receivedAt,
   ).run()
+}
+
+function headerMessageID(headers?: Record<string, string>): string | null {
+  if (!headers) return null
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.trim().toLowerCase() === 'message-id') {
+      const trimmed = value.trim()
+      return trimmed || null
+    }
+  }
+  return null
 }
 
 function buildLocalHeaders(fromAddress: string, replyTo?: string): Record<string, string> {

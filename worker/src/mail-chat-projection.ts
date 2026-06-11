@@ -1,3 +1,5 @@
+import { hasReplyParserMarkers, parseVisibleReply } from './emailReplyParser'
+
 const REPLY_SEPARATOR_MARKERS = [
   'Original Message',
   'Original Mail',
@@ -119,6 +121,11 @@ function extractChatText(text?: string): string {
     return wrappedText
   }
 
+  const parsedByLibrary = extractReplyTextWithLibrary(normalized)
+  if (parsedByLibrary !== null) {
+    return parsedByLibrary
+  }
+
   const boundaryIndex = findQuotedReplyBoundary(normalized)
   if (boundaryIndex === null) {
     return normalized
@@ -180,6 +187,23 @@ function extractMailWrappedChatText(normalized: string): string | null {
   return body || normalized
 }
 
+function extractReplyTextWithLibrary(normalized: string): string | null {
+  if (!hasReplyParserMarkers(normalized)) {
+    return null
+  }
+
+  const parsed = normalizeText(parseVisibleReply(normalized))
+  if (!parsed) {
+    return null
+  }
+
+  if (parsed === normalized) {
+    return null
+  }
+
+  return parsed
+}
+
 function findQuotedReplyBoundary(normalized: string): number | null {
   const lines = normalized.split('\n')
   let seenContent = false
@@ -193,7 +217,11 @@ function findQuotedReplyBoundary(normalized: string): number | null {
     }
 
     if (!seenContent) {
-      if (!isQuotedLine(trimmed) && !isHeaderLine(trimmed) && !isOriginalMessageSeparator(trimmed) && !isTableHeaderLine(trimmed)) {
+      if (isQuotedLine(trimmed)) {
+        if (!startsQuotedReplyBlock(lines, index)) {
+          seenContent = true
+        }
+      } else if (!isHeaderLine(trimmed) && !isOriginalMessageSeparator(trimmed) && !isTableHeaderLine(trimmed)) {
         seenContent = true
       }
       continue
@@ -213,7 +241,8 @@ function findQuotedReplyBoundary(normalized: string): number | null {
 }
 
 function isAttributionLine(line: string): boolean {
-  return ATTRIBUTION_LINE_PATTERNS.some((pattern) => pattern.test(line))
+  const comparable = mailComparableLine(line)
+  return ATTRIBUTION_LINE_PATTERNS.some((pattern) => pattern.test(comparable))
 }
 
 function isForwardedMessageSeparator(line: string): boolean {
@@ -385,6 +414,14 @@ function startsHeaderBlock(lines: string[], startIndex: number): boolean {
 }
 
 function startsQuotedReplyBlock(lines: string[], startIndex: number): boolean {
+  const currentLine = mailComparableLine(lines[startIndex] ?? '')
+  if (currentLine && isAttributionLine(currentLine)) {
+    const nextMeaningfulLine = nextMeaningfulComparableLine(lines, startIndex + 1)
+    if (nextMeaningfulLine && /^>/.test(nextMeaningfulLine.raw.trim())) {
+      return true
+    }
+  }
+
   const unquotedLines: string[] = []
 
   for (let index = startIndex; index < lines.length; index += 1) {
@@ -413,6 +450,20 @@ function startsQuotedReplyBlock(lines: string[], startIndex: number): boolean {
   }
 
   return findMailSectionMarker(unquotedLines) !== null
+}
+
+function nextMeaningfulComparableLine(
+  lines: string[],
+  startIndex: number,
+): { raw: string; comparable: string } | null {
+  for (let index = startIndex; index < lines.length; index += 1) {
+    const raw = lines[index] ?? ''
+    const comparable = mailComparableLine(raw)
+    if (!comparable) continue
+    return { raw, comparable }
+  }
+
+  return null
 }
 
 function htmlToText(html?: string): string {

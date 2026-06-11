@@ -54,6 +54,7 @@ export class CloudflareProvider implements EmailProvider {
     if (req.text) msg.text = req.text
     if (req.html) msg.html = req.html
     if (req.reply_to) msg.replyTo = req.reply_to
+    if (req.headers && Object.keys(req.headers).length > 0) msg.headers = req.headers
     if (req.cc?.length) msg.cc = req.cc
     if (req.bcc?.length) msg.bcc = req.bcc
     if (req.attachments?.length) {

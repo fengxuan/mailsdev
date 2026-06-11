@@ -26,7 +26,7 @@ export class SESProvider implements EmailProvider {
   }
 
   supports(req: SendRequest): boolean {
-    return !req.attachments?.length
+    return !req.attachments?.length && Object.keys(req.headers ?? {}).length === 0
   }
 
   async send(req: SendRequest): Promise<SendResult> {

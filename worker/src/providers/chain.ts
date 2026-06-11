@@ -77,6 +77,7 @@ export async function sendWithChain(
   if (!anySupports) {
     const features: string[] = []
     if (req.attachments?.length) features.push('attachments')
+    if (Object.keys(req.headers ?? {}).length > 0) features.push('headers')
     if (req.cc?.length) features.push('cc')
     if (req.bcc?.length) features.push('bcc')
     const hint = features.length > 0 ? ` (required: ${features.join(', ')})` : ''

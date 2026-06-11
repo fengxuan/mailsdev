@@ -25,6 +25,7 @@ export class ResendProvider implements EmailProvider {
     if (req.text) body.text = req.text
     if (req.html) body.html = req.html
     if (req.reply_to) body.reply_to = req.reply_to
+    if (req.headers && Object.keys(req.headers).length > 0) body.headers = req.headers
     if (req.cc?.length) body.cc = req.cc
     if (req.bcc?.length) body.bcc = req.bcc
     if (req.attachments?.length) {

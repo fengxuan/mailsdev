@@ -1,4 +1,5 @@
 import { describe, expect, test, mock, beforeEach, afterEach } from 'bun:test'
+import { buildMailChatProjection } from '../../worker/src/mail-chat-projection'
 import { parseIncomingEmail } from '../../worker/src/mime'
 import type { Env } from '../../worker/src/index'
 import worker from '../../worker/src/index'
@@ -141,6 +142,37 @@ describe('worker: MIME parsing', () => {
     expect(parsed.bodyHtml).toContain('<strong>114669</strong>')
     expect(parsed.bodyText).toContain('OTP Code:')
     expect(parsed.bodyText).toContain('114669')
+  })
+})
+
+describe('worker: reply parsing projection', () => {
+  test('strips French reply attribution using the library-backed parser', () => {
+    const projection = buildMailChatProjection({
+      bodyText: 'Bonjour\n\nLe 18 mai 2026 à 10:00, Alice <alice@example.com> a écrit :\n> Ancien message',
+    })
+
+    expect(projection.text).toBe('Bonjour')
+  })
+
+  test('keeps forwarded body intact when it contains quoted legacy context', () => {
+    const projection = buildMailChatProjection({
+      bodyText: 'FYI\n\nBegin forwarded message:\nFrom: Alice <alice@example.com>\nSubject: Reply thread\n\nOn Mon, Bob wrote:\n> Please keep this context.\n> It belongs to the forwarded email.',
+    })
+
+    expect(projection.text).toBe(
+      'FYI\n\nOn Mon, Bob wrote:\n> Please keep this context.\n> It belongs to the forwarded email.'
+    )
+  })
+
+  test('strips 163 attribution after html-ish markdown body text normalization', () => {
+    const projection = buildMailChatProjection({
+      bodyText:
+        '&gt; ## This is a header.<br/>&gt;<br/>&gt; 1.   This is the first list item.<br/>&gt; 2.   This is the second list item.<br/>&gt;<br/>&gt; Here\'s some example code:<br/>&gt;<br/>&gt;     return shell_exec("echo $input | $markdown_script");\nAt 2026-05-17 23:54:18, xjfeng-kfsy@canyin.uk wrote:\n>Hello 2\n',
+    })
+
+    expect(projection.text).toBe(
+      '> ## This is a header.\n>\n> 1. This is the first list item.\n> 2. This is the second list item.\n>\n> Here\'s some example code:\n>\n> return shell_exec("echo $input | $markdown_script");'
+    )
   })
 })
 
