@@ -1055,6 +1055,62 @@ describe('worker: POST /api/send', () => {
     expect((byTarget['user-me'].data.message as Record<string, unknown>).topic).toBeUndefined()
   })
 
+  test('local direct send can skip outbound sender realtime ack', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      localUsers: ['you@example.com'],
+      directUsersByMailbox: {
+        'me@example.com': 'user-me',
+        'you@example.com': 'user-you',
+      },
+    })
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      OUTBOUND_FROM_EMAIL: 'chat@example.com',
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    })
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify') {
+        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      if (url === 'https://realtime.example.com/internal/notify-batch') {
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        realtimeNotifyBodies.push(...(body.events ?? []))
+        return new Response(JSON.stringify({ ok: true, count: (body.events ?? []).length }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...SEND_BODY,
+        skip_sender_realtime_ack: true,
+      }),
+    })
+    const harness = createExecutionContextHarness()
+    const response = await worker.fetch(request, env, harness.ctx)
+    await harness.flush()
+
+    expect(response.status).toBe(200)
+    expect(realtimeNotifyBodies).toHaveLength(1)
+    expect(realtimeNotifyBodies[0]?.type).toBe('conversation_updated')
+    expect(realtimeNotifyBodies[0]?.target?.user_id).toBe('user-you')
+    expect(realtimeNotifyBodies[0]?.data).toMatchObject({
+      peer: 'me@example.com',
+      conversation_type: 'direct',
+      message: {
+        direction: 'inbound',
+        text: 'World',
+        status: 'received',
+      },
+    })
+  })
+
   test('mixed local to plus external bcc stays as one outbound email', async () => {
     const { db } = createRealtimeRoutingMockD1({
       localUsers: ['you@example.com'],

@@ -651,6 +651,7 @@ async function handleSend(
     html?: string
     reply_to?: string
     headers?: Record<string, string>
+    skip_sender_realtime_ack?: boolean
     cc?: string[]
     bcc?: string[]
     attachments?: Array<{ filename: string; content: string; content_type?: string }>
@@ -773,7 +774,7 @@ async function handleSend(
       }
     }
 
-    if (primaryRecipient && isRealtimeNotifyConfigured(env)) {
+    if (primaryRecipient && isRealtimeNotifyConfigured(env) && body.skip_sender_realtime_ack !== true) {
       try {
         const isDirectRecipient = await isDirectConversationRecipientMailbox(env, primaryRecipient)
         if (isDirectRecipient) {
@@ -875,7 +876,7 @@ async function handleSend(
   })
 
   const primaryRecipient = filteredTo.length === 1 ? normalizeMailbox(filteredTo[0] ?? '') : null
-  if (primaryRecipient && isRealtimeNotifyConfigured(env)) {
+  if (primaryRecipient && isRealtimeNotifyConfigured(env) && body.skip_sender_realtime_ack !== true) {
     try {
       const isDirectRecipient = await isDirectConversationRecipientMailbox(env, primaryRecipient)
       if (isDirectRecipient) {
