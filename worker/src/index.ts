@@ -2245,6 +2245,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
             emailId: input.currentGroupMessage.emailId,
             senderMailbox: input.currentGroupMessage.senderEmail,
             senderName: input.currentGroupMessage.senderName,
+            subject: input.subject,
             bodyText: input.bodyText,
             bodyHtml: input.bodyHtml,
             receivedAt: input.currentGroupMessage.receivedAt,
@@ -2262,6 +2263,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
               emailId: input.emailId,
               senderMailbox: normalizedSenderMailbox,
               senderName: nonEmptyTrimmed(input.senderName) ?? null,
+              subject: input.subject,
               bodyText: input.bodyText,
               bodyHtml: input.bodyHtml,
               receivedAt: input.receivedAt,
@@ -2491,13 +2493,14 @@ async function getLatestChatGroupMessageIndex(
   email_id: string
   sender_email: string
   sender_name: string | null
+  topic: string | null
   text: string
   render_text: string | null
   received_at: string
 } | null> {
   try {
     const row = await env.DB.prepare(`
-      SELECT email_id, sender_email, sender_name, text, render_text, received_at
+      SELECT email_id, sender_email, sender_name, topic, text, render_text, received_at
       FROM chat_group_message_index
       WHERE group_id = ?
       ORDER BY received_at DESC, email_id DESC
@@ -2506,6 +2509,7 @@ async function getLatestChatGroupMessageIndex(
       email_id: string
       sender_email: string
       sender_name: string | null
+      topic: string | null
       text: string
       render_text: string | null
       received_at: string
@@ -2567,6 +2571,7 @@ function buildRealtimeGroupPayloadEventFields(input: {
     email_id: string
     sender_email: string
     sender_name: string | null
+    topic: string | null
     text: string
     render_text: string | null
     received_at: string
@@ -2599,6 +2604,7 @@ function buildRealtimeGroupPayloadEventFields(input: {
       conversation_type: 'group',
       group_mailbox: input.group.mailbox,
       sync_mode: input.group.sync_mode,
+      ...(input.latestMessage.topic ? { topic: input.latestMessage.topic } : {}),
       direction,
       text: input.latestMessage.text,
       ...(input.latestMessage.render_text ? { render_text: input.latestMessage.render_text } : {}),
@@ -2616,6 +2622,7 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
   emailId: string
   senderMailbox: string
   senderName: string | null
+  subject?: string | null
   bodyText?: string
   bodyHtml?: string
   receivedAt: string
@@ -2626,6 +2633,7 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
       : 'inbound'
   const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
   const senderMailbox = normalizeMailbox(input.senderMailbox)
+  const topic = deriveTopicLabelFromReplySubject(input.subject)
 
   return {
     conversation: {
@@ -2650,6 +2658,7 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
       conversation_type: 'group',
       group_mailbox: input.group.mailbox,
       sync_mode: input.group.sync_mode,
+      ...(topic ? { topic } : {}),
       direction,
       text: projection.text,
       ...(projection.renderText ? { render_text: projection.renderText } : {}),
