@@ -218,6 +218,9 @@ export default {
           case '/internal/conversations':
             response = await handleConversations(url, env, auth.mailbox)
             break
+          case '/internal/thread-latest-inbound':
+            response = await handleLatestInboundThread(url, env, auth.mailbox)
+            break
           case '/internal/send':
             if (request.method !== 'POST') {
               response = Response.json({ error: 'Method not allowed' }, { status: 405 })
@@ -335,6 +338,14 @@ export default {
     ]
 
     await env.DB.batch(statements)
+    await maybeUpsertDirectExternalEmailThreadFromInbound(env, {
+      mailbox,
+      fromAddress,
+      subject,
+      headers: parsed.headers,
+      messageId: parsed.messageId,
+      receivedAt: now,
+    })
     const indexedGroupMessage = await maybeUpsertChatGroupMessageIndex(env, {
       emailId: id,
       mailbox,
@@ -1285,6 +1296,7 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   const beforeId = optionalCursorId(url.searchParams.get('before_id'))
   const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '100'), 500)
   const offset = parseInt(url.searchParams.get('offset') ?? '0')
+  const direction = url.searchParams.get('direction')
 
   const whereParts = ['mailbox = ?', 'received_at > ?']
   const params: Array<string | number> = [authorizedMailbox, since]
@@ -1296,6 +1308,11 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
       OR (peer_address IS NULL AND direction = 'outbound' AND instr(to_address, ',') = 0 AND lower(trim(to_address)) = ?)
     )`)
     params.push(peer, peer, peer)
+  }
+
+  if (direction === 'inbound' || direction === 'outbound') {
+    whereParts.push('direction = ?')
+    params.push(direction)
   }
 
   if (before) {
@@ -1341,6 +1358,165 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
     total,
     has_more: offset + limit < total,
   })
+}
+
+async function handleLatestInboundThread(url: URL, env: Env, authorizedMailbox: string): Promise<Response> {
+  const to = url.searchParams.get('to')
+  if (!to) return Response.json({ error: 'Missing ?to= parameter' }, { status: 400 })
+  if (normalizeMailbox(to) !== authorizedMailbox) {
+    return Response.json({ error: 'Forbidden' }, { status: 403 })
+  }
+
+  const peer = optionalPeer(url.searchParams.get('peer'))
+  if (!peer) {
+    return Response.json({ error: 'Missing ?peer= parameter' }, { status: 400 })
+  }
+
+  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '3'), 20)
+  const rows = await env.DB.prepare(`
+    SELECT
+      id,
+      mailbox,
+      from_address,
+      from_name,
+      to_address,
+      peer_address,
+      subject,
+      headers,
+      message_id,
+      direction,
+      status,
+      provider,
+      received_at
+    FROM emails
+    WHERE mailbox = ?
+      AND direction = 'inbound'
+      AND (
+        peer_address = ?
+        OR (peer_address IS NULL AND lower(trim(from_address)) = ?)
+      )
+      AND message_id IS NOT NULL
+      AND trim(message_id) != ''
+    ORDER BY received_at DESC, id DESC
+    LIMIT ?
+  `).bind(authorizedMailbox, peer, peer, limit).all()
+
+  const emails = (rows.results ?? []).map((row) => {
+    const record = row as Record<string, unknown>
+    return {
+      id: record.id as string,
+      mailbox: record.mailbox as string,
+      from_address: record.from_address as string,
+      from_name: (record.from_name as string) ?? '',
+      to_address: record.to_address as string,
+      subject: (record.subject as string) ?? '',
+      headers: safeJsonParse(record.headers as string, {}),
+      message_id: record.message_id as string,
+      direction: record.direction as string,
+      status: record.status as string,
+      provider: (record.provider as string | null) ?? null,
+      received_at: record.received_at as string,
+    }
+  })
+
+  return Response.json({ emails })
+}
+
+async function maybeUpsertDirectExternalEmailThreadFromInbound(
+  env: Env,
+  input: {
+    mailbox: string
+    fromAddress: string
+    subject: string
+    headers: Record<string, string>
+    messageId: string | null
+    receivedAt: string
+  },
+): Promise<void> {
+  const ownerMailbox = normalizeMailbox(input.mailbox)
+  const peerEmail = normalizeMailbox(input.fromAddress)
+  const inboundMessageID = normalizeMessageID(input.messageId)
+  if (!ownerMailbox || !peerEmail || !inboundMessageID) {
+    return
+  }
+
+  const localDomain = getLocalDomain(env)
+  if (!localDomain) {
+    return
+  }
+  if (peerEmail.endsWith(`@${localDomain}`)) {
+    return
+  }
+
+  if (!(await isDirectConversationRecipientMailbox(env, ownerMailbox))) {
+    return
+  }
+
+  const existing = await env.DB.prepare(`
+    SELECT id, anchor_message_id, references_chain, reply_subject
+    FROM direct_external_email_threads
+    WHERE owner_mailbox = ? AND peer_email = ?
+    LIMIT 1
+  `).bind(ownerMailbox, peerEmail).first<{
+    id: string
+    anchor_message_id: string
+    references_chain: string
+    reply_subject: string | null
+  }>()
+
+  const normalizedReplySubject = normalizeReplySubject(input.subject)
+  const existingAnchor = normalizeMessageID(existing?.anchor_message_id ?? null)
+  if (existingAnchor === inboundMessageID || isMessageIDInReferencesChain(inboundMessageID, existing?.references_chain ?? '')) {
+    if (existing && normalizedReplySubject && normalizedReplySubject !== (existing.reply_subject ?? null)) {
+      await env.DB.prepare(`
+        UPDATE direct_external_email_threads
+        SET reply_subject = ?, updated_at = ?
+        WHERE id = ?
+      `).bind(
+        normalizedReplySubject,
+        input.receivedAt,
+        existing.id,
+      ).run()
+    }
+    return
+  }
+
+  const inboundReferencesChain = appendMessageIDToReferencesChain(buildNormalizedInboundReferencesChain(
+    existing?.references_chain ?? '',
+    existing?.anchor_message_id ?? '',
+    input.headers,
+  ), inboundMessageID)
+
+  if (existing) {
+    await env.DB.prepare(`
+      UPDATE direct_external_email_threads
+      SET anchor_message_id = ?, references_chain = ?, reply_subject = ?, updated_at = ?
+      WHERE id = ?
+    `).bind(
+      inboundMessageID,
+      inboundReferencesChain,
+      normalizedReplySubject,
+      input.receivedAt,
+      existing.id,
+    ).run()
+    return
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO direct_external_email_threads (
+      id, owner_mailbox, peer_email, anchor_message_id, references_chain, reply_subject, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    crypto.randomUUID(),
+    ownerMailbox,
+    peerEmail,
+    inboundMessageID,
+    inboundReferencesChain,
+    normalizedReplySubject,
+    input.receivedAt,
+    input.receivedAt,
+  ).run()
 }
 
 function toInboxEmail(row: Record<string, unknown>) {
@@ -1467,6 +1643,218 @@ function safeJsonParse<T>(value: string | null | undefined, fallback: T): T {
   } catch {
     return fallback
   }
+}
+
+function normalizeReplySubject(subject: string | null | undefined): string | null {
+  const normalized = (subject ?? '').replace(/[\r\n]+/g, ' ').trim()
+  return normalized || null
+}
+
+function getHeaderValueCaseInsensitive(headers: Record<string, string>, name: string): string {
+  const target = name.trim().toLowerCase()
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.trim().toLowerCase() === target) {
+      return value
+    }
+  }
+  return ''
+}
+
+function buildNormalizedInboundReferencesChain(
+  existingReferencesChain: string,
+  existingAnchorMessageID: string,
+  headers: Record<string, string>,
+): string {
+  const localTokens = parseMessageIDList(buildReferencesHeader(existingReferencesChain, existingAnchorMessageID))
+  const referencesTokens = parseMessageIDList(getHeaderValueCaseInsensitive(headers, 'References'))
+  const inReplyToTokens = parseMessageIDList(getHeaderValueCaseInsensitive(headers, 'In-Reply-To'))
+  const headerTokens = parseMessageIDList(normalizeReferencesChain([
+    ...referencesTokens,
+    ...inReplyToTokens,
+  ].join(' ')))
+
+  if (!hasMessageIDOverlap(localTokens, headerTokens)) {
+    return normalizeReferencesChain(headerTokens.join(' '))
+  }
+
+  return normalizeReferencesChain(mergeOrderedMessageIDLists(localTokens, headerTokens).join(' '))
+}
+
+function hasMessageIDOverlap(left: string[], right: string[]): boolean {
+  if (left.length === 0 || right.length === 0) {
+    return false
+  }
+  const leftSet = new Set(left)
+  return right.some((token) => leftSet.has(token))
+}
+
+function mergeOrderedMessageIDLists(primary: string[], secondary: string[]): string[] {
+  const nodes = Array.from(new Set([...primary, ...secondary]))
+  if (nodes.length <= 1) {
+    return nodes
+  }
+
+  const primaryPosition = new Map<string, number>()
+  const secondaryPosition = new Map<string, number>()
+  primary.forEach((token, index) => {
+    if (!primaryPosition.has(token)) primaryPosition.set(token, index)
+  })
+  secondary.forEach((token, index) => {
+    if (!secondaryPosition.has(token)) secondaryPosition.set(token, index)
+  })
+
+  const adjacency = new Map<string, Set<string>>()
+  const indegree = new Map<string, number>()
+  for (const token of nodes) {
+    adjacency.set(token, new Set())
+    indegree.set(token, 0)
+  }
+
+  function addSequenceEdges(sequence: string[]) {
+    for (let index = 0; index < sequence.length - 1; index += 1) {
+      const from = sequence[index]
+      const to = sequence[index + 1]
+      if (from === to) continue
+      const neighbors = adjacency.get(from)
+      if (!neighbors || neighbors.has(to)) continue
+      neighbors.add(to)
+      indegree.set(to, (indegree.get(to) ?? 0) + 1)
+    }
+  }
+
+  addSequenceEdges(primary)
+  addSequenceEdges(secondary)
+
+  const remaining = new Set(nodes)
+  const ordered: string[] = []
+
+  while (remaining.size > 0) {
+    const available = [...remaining]
+      .filter((token) => (indegree.get(token) ?? 0) === 0)
+      .sort((left, right) => compareMessageIDMergePriority(
+        left,
+        right,
+        primaryPosition,
+        secondaryPosition,
+      ))
+
+    const next = available[0]
+      ?? [...remaining].sort((left, right) => compareMessageIDMergePriority(
+        left,
+        right,
+        primaryPosition,
+        secondaryPosition,
+      ))[0]
+    if (!next) break
+
+    ordered.push(next)
+    remaining.delete(next)
+    for (const neighbor of adjacency.get(next) ?? []) {
+      indegree.set(neighbor, Math.max(0, (indegree.get(neighbor) ?? 0) - 1))
+    }
+  }
+
+  return ordered
+}
+
+function compareMessageIDMergePriority(
+  left: string,
+  right: string,
+  primaryPosition: Map<string, number>,
+  secondaryPosition: Map<string, number>,
+): number {
+  const leftSecondary = secondaryPosition.get(left) ?? Number.POSITIVE_INFINITY
+  const rightSecondary = secondaryPosition.get(right) ?? Number.POSITIVE_INFINITY
+  if (leftSecondary !== rightSecondary) {
+    return leftSecondary - rightSecondary
+  }
+
+  const leftPrimary = primaryPosition.get(left) ?? Number.POSITIVE_INFINITY
+  const rightPrimary = primaryPosition.get(right) ?? Number.POSITIVE_INFINITY
+  if (leftPrimary !== rightPrimary) {
+    return leftPrimary - rightPrimary
+  }
+
+  return left.localeCompare(right)
+}
+
+const DIRECT_EXTERNAL_THREAD_REFERENCE_LIMIT = 20
+const DIRECT_EXTERNAL_THREAD_REFERENCE_MAX_BYTES = 4096
+const MESSAGE_ID_PATTERN = /<[^<>\r\n]+>/g
+const BARE_MESSAGE_ID_CANDIDATE_PATTERN = /[^\s<>,;]+@[^\s<>,;]+/g
+const BARE_MESSAGE_ID_PATTERN = /^[^<>\s@]+@[^<>\s@]+$/
+
+function buildReferencesHeader(referencesChain: string, anchorMessageID: string): string {
+  const normalizedAnchorMessageID = normalizeMessageID(anchorMessageID)
+  return normalizeReferencesChain([
+    ...parseMessageIDList(referencesChain),
+    ...(normalizedAnchorMessageID ? [normalizedAnchorMessageID] : []),
+  ].join(' '))
+}
+
+function appendMessageIDToReferencesChain(referencesChain: string, messageID: string): string {
+  const normalizedMessageID = normalizeMessageID(messageID)
+  if (!normalizedMessageID) return normalizeReferencesChain(referencesChain)
+  return normalizeReferencesChain([...parseMessageIDList(referencesChain), normalizedMessageID].join(' '))
+}
+
+function isMessageIDInReferencesChain(messageID: string, referencesChain: string): boolean {
+  const normalized = normalizeMessageID(messageID)
+  if (!normalized) return false
+  return parseMessageIDList(referencesChain).includes(normalized)
+}
+
+function normalizeReferencesChain(value: string): string {
+  const tokens = parseMessageIDList(value)
+  if (tokens.length === 0) return ''
+
+  const deduped: string[] = []
+  const seen = new Set<string>()
+  for (const token of tokens) {
+    if (seen.has(token)) continue
+    seen.add(token)
+    deduped.push(token)
+  }
+
+  let trimmed = trimReferencesChainPreservingRoot(deduped)
+  while (trimmed.length > 0 && new TextEncoder().encode(trimmed.join(' ')).byteLength > DIRECT_EXTERNAL_THREAD_REFERENCE_MAX_BYTES) {
+    if (trimmed.length === 1) break
+    trimmed = [trimmed[0], ...trimmed.slice(2)]
+  }
+  return trimmed.join(' ')
+}
+
+function trimReferencesChainPreservingRoot(tokens: string[]): string[] {
+  if (tokens.length <= DIRECT_EXTERNAL_THREAD_REFERENCE_LIMIT) {
+    return tokens
+  }
+  return [
+    tokens[0],
+    ...tokens.slice(-(DIRECT_EXTERNAL_THREAD_REFERENCE_LIMIT - 1)),
+  ]
+}
+
+function parseMessageIDList(value: string | null | undefined): string[] {
+  if (!value) return []
+  const bracketedTokens = value.match(MESSAGE_ID_PATTERN) ?? []
+  if (bracketedTokens.length > 0) return bracketedTokens
+
+  return (value.match(BARE_MESSAGE_ID_CANDIDATE_PATTERN) ?? [])
+    .map((token) => normalizeMessageID(token))
+    .filter((token): token is string => Boolean(token))
+}
+
+function normalizeMessageID(value: string | null | undefined): string | null {
+  const trimmed = value?.trim()
+  if (!trimmed) return null
+  const bracketedTokens = trimmed.match(MESSAGE_ID_PATTERN)
+  if (bracketedTokens && bracketedTokens.length > 0) {
+    return bracketedTokens[0] ?? null
+  }
+  if (BARE_MESSAGE_ID_PATTERN.test(trimmed)) {
+    return `<${trimmed}>`
+  }
+  return null
 }
 
 function isRealtimeNotifyConfigured(env: Env): boolean {
@@ -2651,6 +3039,7 @@ function isInternalReadMailboxPath(pathname: string): boolean {
     || pathname === '/internal/code'
     || pathname === '/internal/email'
     || pathname === '/internal/conversations'
+    || pathname === '/internal/thread-latest-inbound'
     || pathname === '/internal/sync'
 }
 

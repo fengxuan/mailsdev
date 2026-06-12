@@ -201,6 +201,25 @@ function createMockD1() {
   }
 }
 
+function decodeOutboundEmailInsertArgs(boundArgs: unknown[]) {
+  return {
+    id: String(boundArgs[0] ?? ''),
+    mailbox: String(boundArgs[1] ?? ''),
+    fromAddress: String(boundArgs[2] ?? ''),
+    fromName: String(boundArgs[3] ?? ''),
+    toAddress: String(boundArgs[4] ?? ''),
+    peerAddress: String(boundArgs[5] ?? ''),
+    subject: String(boundArgs[6] ?? ''),
+    bodyText: String(boundArgs[7] ?? ''),
+    bodyHtml: String(boundArgs[8] ?? ''),
+    headers: String(boundArgs[9] ?? ''),
+    messageId: boundArgs[10] === null ? null : String(boundArgs[10] ?? ''),
+    hasAttachments: Number(boundArgs[11] ?? 0),
+    attachmentCount: Number(boundArgs[12] ?? 0),
+    provider: String(boundArgs[13] ?? ''),
+  }
+}
+
 interface RealtimeRoutingFixtures {
   localUsers?: string[]
   deletedMailboxes?: string[]
@@ -516,19 +535,21 @@ describe('worker: POST /api/send', () => {
     // Verify D1 insert was called after the local-recipient and deleted-mailbox lookups
     expect(prepareMock).toHaveBeenCalledTimes(3)
     expect(bindMock).toHaveBeenCalledTimes(3)
-    const boundArgs = (bindMock as any).mock.calls.at(-1)
-    expect(boundArgs[0]).toBe('resend-id-123') // id
-    expect(boundArgs[1]).toBe('me@example.com') // mailbox
-    expect(boundArgs[2]).toBe('me@example.com') // from_address
-    expect(boundArgs[3]).toBe('') // from_name
-    expect(boundArgs[4]).toBe('you@example.com') // to_address
-    expect(boundArgs[5]).toBe('you@example.com') // peer_address
-    expect(boundArgs[6]).toBe('Hello') // subject
-    expect(boundArgs[7]).toBe('World') // body_text
-    expect(boundArgs[8]).toBe('') // body_html
-    expect(boundArgs[9]).toBe(0) // has_attachments
-    expect(boundArgs[10]).toBe(0) // attachment_count
-    expect(boundArgs[11]).toBe('resend') // provider
+    const outboundInsert = decodeOutboundEmailInsertArgs((bindMock as any).mock.calls.at(-1) ?? [])
+    expect(outboundInsert.id).toBe('resend-id-123')
+    expect(outboundInsert.mailbox).toBe('me@example.com')
+    expect(outboundInsert.fromAddress).toBe('me@example.com')
+    expect(outboundInsert.fromName).toBe('')
+    expect(outboundInsert.toAddress).toBe('you@example.com')
+    expect(outboundInsert.peerAddress).toBe('you@example.com')
+    expect(outboundInsert.subject).toBe('Hello')
+    expect(outboundInsert.bodyText).toBe('World')
+    expect(outboundInsert.bodyHtml).toBe('')
+    expect(outboundInsert.headers).toBe('{}')
+    expect(outboundInsert.messageId).toBeNull()
+    expect(outboundInsert.hasAttachments).toBe(0)
+    expect(outboundInsert.attachmentCount).toBe(0)
+    expect(outboundInsert.provider).toBe('resend')
   })
 
   test('returns 400 for missing fields', async () => {
@@ -666,9 +687,9 @@ describe('worker: POST /api/send', () => {
     expect(resendBody.attachments[1].content_type).toBeUndefined()
 
     // Verify D1 records has_attachments on the outbound insert
-    const boundArgs = (bindMock as any).mock.calls.at(-1)
-    expect(boundArgs[9]).toBe(1) // has_attachments
-    expect(boundArgs[10]).toBe(2) // attachment_count
+    const outboundInsert = decodeOutboundEmailInsertArgs((bindMock as any).mock.calls.at(-1) ?? [])
+    expect(outboundInsert.hasAttachments).toBe(1)
+    expect(outboundInsert.attachmentCount).toBe(2)
   })
 
   test('returns 502 when all providers fail', async () => {
@@ -725,8 +746,8 @@ describe('worker: POST /api/send', () => {
     expect(sesUrl).toBe('https://email.us-east-1.amazonaws.com/v2/email/outbound-emails')
     expect(sesInit.headers.authorization).toContain('Credential=akid/')
 
-    const boundArgs = (bindMock as any).mock.calls.at(-1)
-    expect(boundArgs[11]).toBe('ses')
+    const outboundInsert = decodeOutboundEmailInsertArgs((bindMock as any).mock.calls.at(-1) ?? [])
+    expect(outboundInsert.provider).toBe('ses')
   })
 
   test('falls back to Resend when SES fails', async () => {
@@ -826,8 +847,8 @@ describe('worker: POST /api/send', () => {
     expect(emailSend).toHaveBeenCalledTimes(1)
     expect(fetchMock).not.toHaveBeenCalled()
 
-    const boundArgs = (bindMock as any).mock.calls.at(-1)
-    expect(boundArgs[11]).toBe('cloudflare')
+    const outboundInsert = decodeOutboundEmailInsertArgs((bindMock as any).mock.calls.at(-1) ?? [])
+    expect(outboundInsert.provider).toBe('cloudflare')
   })
 
   test('Cloudflare provider handles attachments/cc/bcc natively', async () => {
@@ -1376,6 +1397,9 @@ function makeForwardableEmailMessage(input: {
   subject: string
   bodyText?: string
   bodyHtml?: string
+  messageId?: string
+  references?: string
+  inReplyTo?: string
 }): ForwardableEmailMessage {
   const contentType = input.bodyHtml ? 'text/html; charset="utf-8"' : 'text/plain; charset="utf-8"'
   const body = input.bodyHtml ?? input.bodyText ?? ''
@@ -1383,6 +1407,9 @@ function makeForwardableEmailMessage(input: {
     `From: ${input.from}`,
     `To: ${input.to}`,
     `Subject: ${input.subject}`,
+    ...(input.messageId ? [`Message-ID: ${input.messageId}`] : []),
+    ...(input.references ? [`References: ${input.references}`] : []),
+    ...(input.inReplyTo ? [`In-Reply-To: ${input.inReplyTo}`] : []),
     `Content-Type: ${contentType}`,
     '',
     body,
@@ -1764,6 +1791,183 @@ describe('worker: inbound email realtime notify', () => {
 
     expect(chatGroupMessageIndexRows).toHaveLength(0)
     expect((globalThis.fetch as any).mock.calls).toHaveLength(0)
+  })
+})
+
+function createDirectExternalThreadTrackingMockD1(directExternalEmailThreads: DirectExternalEmailThreadRow[]) {
+  return {
+    prepare: mock((sql: string) => ({
+      bind: mock((...params: unknown[]) => {
+        if (sql.includes('FROM deleted_mailboxes')) {
+          return {
+            first: mock(() => Promise.resolve(null)),
+            all: mock(() => Promise.resolve({ results: [] })),
+            run: mock(() => Promise.resolve({ success: true })),
+          }
+        }
+        if (sql.includes('FROM chat_groups')) {
+          return {
+            first: mock(() => Promise.resolve(null)),
+            all: mock(() => Promise.resolve({ results: [] })),
+            run: mock(() => Promise.resolve({ success: true })),
+          }
+        }
+        if (sql.includes('INSERT INTO emails') || sql.includes('INSERT INTO attachments')) {
+          return {
+            first: mock(() => Promise.resolve(null)),
+            all: mock(() => Promise.resolve({ results: [] })),
+            run: mock(() => Promise.resolve({ success: true })),
+          }
+        }
+        if (sql.includes('FROM direct_external_email_threads') && sql.includes('WHERE owner_mailbox = ? AND peer_email = ?')) {
+          return {
+            first: mock(() => Promise.resolve(
+              directExternalEmailThreads.find((row) =>
+                row.owner_mailbox === String(params[0]) && row.peer_email === String(params[1])
+              ) ?? null
+            )),
+            all: mock(() => Promise.resolve({ results: [] })),
+            run: mock(() => Promise.resolve({ success: true })),
+          }
+        }
+        if (sql.includes('UPDATE direct_external_email_threads')) {
+          return {
+            first: mock(() => Promise.resolve(null)),
+            all: mock(() => Promise.resolve({ results: [] })),
+            run: mock(() => {
+              const existing = directExternalEmailThreads.find((row) => row.id === String(params[4]))
+              if (existing) {
+                existing.anchor_message_id = String(params[0])
+                existing.references_chain = String(params[1])
+                existing.reply_subject = params[2] === null ? null : String(params[2])
+                existing.updated_at = String(params[3])
+              }
+              return Promise.resolve({ success: true })
+            }),
+          }
+        }
+        if (sql.includes('INSERT INTO direct_external_email_threads')) {
+          return {
+            first: mock(() => Promise.resolve(null)),
+            all: mock(() => Promise.resolve({ results: [] })),
+            run: mock(() => {
+              directExternalEmailThreads.push({
+                id: String(params[0]),
+                owner_mailbox: String(params[1]),
+                peer_email: String(params[2]),
+                anchor_message_id: String(params[3]),
+                references_chain: String(params[4]),
+                reply_subject: params[5] === null ? null : String(params[5]),
+                created_at: String(params[6]),
+                updated_at: String(params[7]),
+              })
+              return Promise.resolve({ success: true })
+            }),
+          }
+        }
+        return {
+          first: mock(() => Promise.resolve(null)),
+          all: mock(() => Promise.resolve({ results: [] })),
+          run: mock(() => Promise.resolve({ success: true })),
+        }
+      }),
+    })),
+    batch: async (statements: Array<{ run: () => Promise<unknown> }>) => Promise.all(statements.map((statement) => statement.run())),
+  } as unknown as D1Database
+}
+
+describe('worker: inbound direct external thread tracking', () => {
+  test('inbound external reply updates direct_external_email_threads with merged chain', async () => {
+    const directExternalEmailThreads: DirectExternalEmailThreadRow[] = [{
+      id: 'thread-existing-1',
+      owner_mailbox: 'recipient@example.com',
+      peer_email: 'sender@example.com',
+      anchor_message_id: '<chat-anchor-original@canyin.uk>',
+      references_chain: '<chat-root@canyin.uk> <chat-before@canyin.uk>',
+      reply_subject: 'Chat',
+      created_at: '2026-05-15T00:00:00.000Z',
+      updated_at: '2026-05-15T00:00:00.000Z',
+    }]
+    const env = {
+      DB: createDirectExternalThreadTrackingMockD1(directExternalEmailThreads),
+      MAILBOX: 'worker@canyin.uk',
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Re: Project Alpha',
+      bodyText: 'Reply from external',
+      messageId: '<external-reply@example.com>',
+      references: '<chat-root@canyin.uk> <chat-anchor-original@canyin.uk>',
+    })
+
+    await worker.email(message, env)
+
+    expect(directExternalEmailThreads).toHaveLength(1)
+    expect(directExternalEmailThreads[0]).toMatchObject({
+      owner_mailbox: 'recipient@example.com',
+      peer_email: 'sender@example.com',
+      anchor_message_id: '<external-reply@example.com>',
+      references_chain: '<chat-root@canyin.uk> <chat-before@canyin.uk> <chat-anchor-original@canyin.uk> <external-reply@example.com>',
+      reply_subject: 'Re: Project Alpha',
+    })
+  })
+
+  test('inbound external new compose switches direct_external_email_threads to a new chain', async () => {
+    const directExternalEmailThreads: DirectExternalEmailThreadRow[] = [{
+      id: 'thread-existing-2',
+      owner_mailbox: 'recipient@example.com',
+      peer_email: 'sender@example.com',
+      anchor_message_id: '<chat-current-anchor@canyin.uk>',
+      references_chain: '<chat-current-root@canyin.uk>',
+      reply_subject: 'Chat',
+      created_at: '2026-05-15T00:00:00.000Z',
+      updated_at: '2026-05-15T00:00:00.000Z',
+    }]
+    const env = {
+      DB: createDirectExternalThreadTrackingMockD1(directExternalEmailThreads),
+      MAILBOX: 'worker@canyin.uk',
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'A different note',
+      bodyText: 'New compose from external',
+      messageId: '<external-new-compose@example.com>',
+    })
+
+    await worker.email(message, env)
+
+    expect(directExternalEmailThreads).toHaveLength(1)
+    expect(directExternalEmailThreads[0]).toMatchObject({
+      owner_mailbox: 'recipient@example.com',
+      peer_email: 'sender@example.com',
+      anchor_message_id: '<external-new-compose@example.com>',
+      references_chain: '<external-new-compose@example.com>',
+      reply_subject: 'A different note',
+    })
+  })
+
+  test('inbound local-domain sender does not update direct_external_email_threads', async () => {
+    const directExternalEmailThreads: DirectExternalEmailThreadRow[] = []
+    const env = {
+      DB: createDirectExternalThreadTrackingMockD1(directExternalEmailThreads),
+      MAILBOX: 'worker@canyin.uk',
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'peer@canyin.uk',
+      to: 'recipient@example.com',
+      subject: 'Internal mail',
+      bodyText: 'This should not touch direct_external_email_threads',
+      messageId: '<internal-mail@canyin.uk>',
+    })
+
+    await worker.email(message, env)
+
+    expect(directExternalEmailThreads).toHaveLength(0)
   })
 })
 
@@ -2255,6 +2459,134 @@ describe('worker: GET /api/sync', () => {
     const messageBind = capturedBinds.find((entry) => entry.sql.includes('SELECT * FROM emails'))
     expect(messageBind).toBeTruthy()
     expect(messageBind!.args.slice(2, 5)).toEqual(['friend@example.com', 'friend@example.com', 'friend@example.com'])
+  })
+
+  test('sync applies direction filter when requested', async () => {
+    const capturedSqls: string[] = []
+    const capturedBinds: Array<{ sql: string; args: unknown[] }> = []
+    const db = {
+      prepare: mock((sql: string) => {
+        capturedSqls.push(sql)
+        return {
+          bind: mock((...args: unknown[]) => {
+            capturedBinds.push({ sql, args })
+            return {
+              first: mock(() => Promise.resolve({ total: 1 })),
+              all: mock(() => Promise.resolve({ results: [makeSyncEmail({ direction: 'inbound' })] })),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = singleMailboxEnv('user@test.com', { DB: db })
+    const response = await worker.fetch(
+      authedRequest('http://localhost/api/sync?to=user@test.com&peer=friend@example.com&direction=inbound&since=1970-01-01T00:00:00Z&limit=3'),
+      env,
+    )
+
+    expect(response.status).toBe(200)
+    const messageQuery = capturedSqls.find((sql) => sql.includes('SELECT * FROM emails'))
+    expect(messageQuery).toBeTruthy()
+    expect(messageQuery!).toContain('direction = ?')
+    const messageBind = capturedBinds.find((entry) => entry.sql.includes('SELECT * FROM emails'))
+    expect(messageBind).toBeTruthy()
+    expect(messageBind!.args).toContain('inbound')
+  })
+
+  test('latest inbound thread returns lightweight inbound thread rows without count or attachment queries', async () => {
+    const capturedSqls: string[] = []
+    const db = {
+      prepare: mock((sql: string) => {
+        capturedSqls.push(sql)
+        return {
+          bind: mock(() => {
+            if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+              return {
+                first: mock(() => Promise.resolve({ id: 'user-1' })),
+                all: mock(() => Promise.resolve({ results: [] })),
+                run: mock(() => Promise.resolve({ success: true })),
+              }
+            }
+            return {
+              first: mock(() => Promise.resolve(null)),
+              all: mock(() => Promise.resolve({
+                results: [
+                  makeSyncEmail({
+                    from_address: 'friend@example.com',
+                    peer_address: 'friend@example.com',
+                    subject: 'Fresh topic',
+                    message_id: '<fresh-topic@test.com>',
+                    headers: '{"references":"<older@test.com>"}',
+                    direction: 'inbound',
+                  }),
+                ],
+              })),
+              run: mock(() => Promise.resolve({ success: true })),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
+    } as Env
+    const accessToken = createAccessToken({ sub: 'user-1', email: 'user@test.com', mailbox: 'user@test.com' })
+    const response = await worker.fetch(
+      new Request('http://localhost/internal/thread-latest-inbound?to=user@test.com&peer=friend@example.com&limit=3', {
+        headers: {
+          Authorization: 'Bearer internal-token',
+          'X-Mailbox': 'user@test.com',
+          'X-User-Authorization': `Bearer ${accessToken}`,
+        },
+      }),
+      env,
+    )
+    const json = await response.json() as {
+      emails: Array<{
+        subject: string
+        message_id: string
+        headers: Record<string, string>
+        body_text?: string
+      }>
+    }
+
+    expect(response.status).toBe(200)
+    expect(json.emails).toHaveLength(1)
+    expect(json.emails[0]?.subject).toBe('Fresh topic')
+    expect(json.emails[0]?.message_id).toBe('<fresh-topic@test.com>')
+    expect(json.emails[0]?.headers).toEqual({ references: '<older@test.com>' })
+    expect(json.emails[0]?.body_text).toBeUndefined()
+    expect(capturedSqls.some((sql) => sql.includes('COUNT(*)'))).toBe(false)
+    expect(capturedSqls.some((sql) => sql.includes('FROM attachments'))).toBe(false)
+  })
+
+  test('latest inbound thread requires peer parameter', async () => {
+    const { db } = createSyncMockD1()
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
+    } as Env
+    const accessToken = createAccessToken({ sub: 'user-1', email: 'user@test.com', mailbox: 'user@test.com' })
+
+    const response = await worker.fetch(
+      new Request('http://localhost/internal/thread-latest-inbound?to=user@test.com', {
+        headers: {
+          Authorization: 'Bearer internal-token',
+          'X-Mailbox': 'user@test.com',
+          'X-User-Authorization': `Bearer ${accessToken}`,
+        },
+      }),
+      env,
+    )
+    const json = await response.json() as { error: string }
+
+    expect(response.status).toBe(400)
+    expect(json.error).toBe('Missing ?peer= parameter')
   })
 
   test('requires auth when AUTH_TOKEN set', async () => {
