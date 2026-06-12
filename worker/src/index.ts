@@ -1683,6 +1683,12 @@ function normalizeReplySubject(subject: string | null | undefined): string | nul
   return normalized || null
 }
 
+function stripReplySubjectPrefix(subject: string | null | undefined): string | null {
+  const normalized = normalizeReplySubject(subject)
+  if (!normalized) return null
+  return normalized.replace(/^(?:(?:re|fw|fwd)\s*:\s*)+/i, '').trim() || normalized
+}
+
 function deriveExternalDirectTopicLabel(env: Env, peer: string, subject: string | null | undefined): string | null {
   const localDomain = getLocalDomain(env)
   if (!localDomain) return null
@@ -1693,9 +1699,7 @@ function deriveExternalDirectTopicLabel(env: Env, peer: string, subject: string 
 }
 
 function deriveTopicLabelFromReplySubject(subject: string | null | undefined): string | null {
-  const normalized = normalizeReplySubject(subject)
-  if (!normalized) return null
-  return normalized.replace(/^(?:re|fw|fwd)\s*:\s*/i, '').trim() || normalized
+  return stripReplySubjectPrefix(subject)
 }
 
 function normalizeTopicKey(value: string | null | undefined): string {

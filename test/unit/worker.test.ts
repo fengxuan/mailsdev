@@ -2089,6 +2089,46 @@ describe('worker: inbound direct external thread tracking', () => {
     })
   })
 
+  test('inbound external reply strips repeated reply prefixes when deriving topic labels', async () => {
+    const directExternalEmailThreads: DirectExternalEmailThreadRow[] = [{
+      id: 'thread-topic-work-1',
+      owner_mailbox: 'recipient@example.com',
+      peer_email: 'sender@example.com',
+      topic_key: 'work',
+      topic_label: 'work',
+      anchor_message_id: '<work-anchor@canyin.uk>',
+      references_chain: '<work-root@canyin.uk>',
+      reply_subject: 'work',
+      created_at: '2026-05-15T00:00:00.000Z',
+      updated_at: '2026-05-15T00:00:00.000Z',
+    }]
+    const env = {
+      DB: createDirectExternalThreadTrackingMockD1(directExternalEmailThreads),
+      MAILBOX: 'worker@canyin.uk',
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Re: Re: work',
+      bodyText: 'Reply to existing work thread',
+      messageId: '<work-reply@example.com>',
+      references: '<work-root@canyin.uk> <work-anchor@canyin.uk>',
+    })
+
+    await worker.email(message, env)
+
+    expect(directExternalEmailThreads).toHaveLength(1)
+    expect(directExternalEmailThreads[0]).toMatchObject({
+      id: 'thread-topic-work-1',
+      topic_key: 'work',
+      topic_label: 'work',
+      anchor_message_id: '<work-reply@example.com>',
+      references_chain: '<work-root@canyin.uk> <work-anchor@canyin.uk> <work-reply@example.com>',
+      reply_subject: 'Re: Re: work',
+    })
+  })
+
   test('inbound local-domain sender does not update direct_external_email_threads', async () => {
     const directExternalEmailThreads: DirectExternalEmailThreadRow[] = []
     const env = {
