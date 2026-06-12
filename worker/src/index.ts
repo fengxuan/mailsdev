@@ -764,6 +764,7 @@ async function handleSend(
           mailbox: email.mailbox,
           senderMailbox,
           senderName,
+          subject: body.subject,
           bodyText: body.text,
           bodyHtml: body.html,
           emailId: email.id,
