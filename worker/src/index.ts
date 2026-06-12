@@ -2303,7 +2303,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
     ? buildRealtimeMessageProjection(latestEmail.body_text, latestEmail.body_html)
     : EMPTY_REALTIME_MESSAGE_PROJECTION
   const latestTopic = latestEmail
-    ? deriveExternalDirectTopicLabel(env, normalizedSenderMailbox, latestEmail.subject)
+    ? deriveTopicLabelFromReplySubject(latestEmail.subject)
     : null
 
   return [{
@@ -2672,7 +2672,7 @@ function buildRealtimeDirectPayloadEventFieldsForInboundEmail(input: {
   receivedAt: string
 }): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
   const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
-  const topic = deriveExternalDirectTopicLabel(input.env, input.peer, input.subject)
+  const topic = deriveTopicLabelFromReplySubject(input.subject)
 
   return {
     conversation: {
@@ -2722,7 +2722,7 @@ function buildRealtimeDirectPayloadEventFieldsForOutboundEmail(input: {
   status: 'sent' | 'failed'
 }): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
   const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
-  const topic = deriveExternalDirectTopicLabel(input.env, input.peer, input.subject)
+  const topic = deriveTopicLabelFromReplySubject(input.subject)
 
   return {
     conversation: {
