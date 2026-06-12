@@ -7,6 +7,19 @@ import { createHmac } from 'node:crypto'
 
 const DEFAULT_AUTH_TOKEN = 'unit_test_auth_token'
 
+type DirectExternalEmailThreadRow = {
+  id: string
+  owner_mailbox: string
+  peer_email: string
+  topic_key?: string
+  topic_label?: string | null
+  anchor_message_id: string
+  references_chain: string
+  reply_subject?: string | null
+  created_at: string
+  updated_at: string
+}
+
 function singleMailboxEnv(
   mailbox: string,
   env: Omit<Env, 'AUTH_TOKEN' | 'MAILBOX'> & { AUTH_TOKEN?: string; MAILBOX?: string }
@@ -1010,6 +1023,7 @@ describe('worker: POST /api/send', () => {
         sender_name: null,
       },
     })
+    expect((byTarget['user-you'].data.message as Record<string, unknown>).topic).toBeUndefined()
     expect(byTarget['user-me']).toBeTruthy()
     expect(byTarget['user-me'].data).toMatchObject({
       peer: 'you@example.com',
@@ -1038,6 +1052,7 @@ describe('worker: POST /api/send', () => {
         sender_name: null,
       },
     })
+    expect((byTarget['user-me'].data.message as Record<string, unknown>).topic).toBeUndefined()
   })
 
   test('mixed local to plus external bcc stays as one outbound email', async () => {
@@ -1821,12 +1836,17 @@ function createDirectExternalThreadTrackingMockD1(directExternalEmailThreads: Di
         }
         if (sql.includes('FROM direct_external_email_threads') && sql.includes('WHERE owner_mailbox = ? AND peer_email = ?')) {
           return {
-            first: mock(() => Promise.resolve(
-              directExternalEmailThreads.find((row) =>
-                row.owner_mailbox === String(params[0]) && row.peer_email === String(params[1])
-              ) ?? null
-            )),
-            all: mock(() => Promise.resolve({ results: [] })),
+            first: mock(() => Promise.resolve(null)),
+            all: mock(() => Promise.resolve({
+              results: directExternalEmailThreads
+                .filter((row) =>
+                  row.owner_mailbox === String(params[0]) && row.peer_email === String(params[1])
+                )
+                .sort((lhs, rhs) => {
+                  const updatedOrder = String(rhs.updated_at).localeCompare(String(lhs.updated_at))
+                  return updatedOrder !== 0 ? updatedOrder : String(rhs.id).localeCompare(String(lhs.id))
+                }),
+            })),
             run: mock(() => Promise.resolve({ success: true })),
           }
         }
@@ -1835,12 +1855,13 @@ function createDirectExternalThreadTrackingMockD1(directExternalEmailThreads: Di
             first: mock(() => Promise.resolve(null)),
             all: mock(() => Promise.resolve({ results: [] })),
             run: mock(() => {
-              const existing = directExternalEmailThreads.find((row) => row.id === String(params[4]))
+              const existing = directExternalEmailThreads.find((row) => row.id === String(params[5]))
               if (existing) {
-                existing.anchor_message_id = String(params[0])
-                existing.references_chain = String(params[1])
-                existing.reply_subject = params[2] === null ? null : String(params[2])
-                existing.updated_at = String(params[3])
+                existing.topic_label = params[0] === null ? null : String(params[0])
+                existing.anchor_message_id = String(params[1])
+                existing.references_chain = String(params[2])
+                existing.reply_subject = params[3] === null ? null : String(params[3])
+                existing.updated_at = String(params[4])
               }
               return Promise.resolve({ success: true })
             }),
@@ -1855,11 +1876,13 @@ function createDirectExternalThreadTrackingMockD1(directExternalEmailThreads: Di
                 id: String(params[0]),
                 owner_mailbox: String(params[1]),
                 peer_email: String(params[2]),
-                anchor_message_id: String(params[3]),
-                references_chain: String(params[4]),
-                reply_subject: params[5] === null ? null : String(params[5]),
-                created_at: String(params[6]),
-                updated_at: String(params[7]),
+                topic_key: String(params[3]),
+                topic_label: params[4] === null ? null : String(params[4]),
+                anchor_message_id: String(params[5]),
+                references_chain: String(params[6]),
+                reply_subject: params[7] === null ? null : String(params[7]),
+                created_at: String(params[8]),
+                updated_at: String(params[9]),
               })
               return Promise.resolve({ success: true })
             }),
@@ -1940,13 +1963,73 @@ describe('worker: inbound direct external thread tracking', () => {
 
     await worker.email(message, env)
 
-    expect(directExternalEmailThreads).toHaveLength(1)
-    expect(directExternalEmailThreads[0]).toMatchObject({
+    expect(directExternalEmailThreads).toHaveLength(2)
+    expect(directExternalEmailThreads[1]).toMatchObject({
       owner_mailbox: 'recipient@example.com',
       peer_email: 'sender@example.com',
+      topic_key: 'a-different-note',
+      topic_label: 'A different note',
       anchor_message_id: '<external-new-compose@example.com>',
       references_chain: '<external-new-compose@example.com>',
       reply_subject: 'A different note',
+    })
+  })
+
+  test('inbound external reply chooses the matching topic by ancestry over subject recency', async () => {
+    const directExternalEmailThreads: DirectExternalEmailThreadRow[] = [
+      {
+        id: 'thread-topic-1',
+        owner_mailbox: 'recipient@example.com',
+        peer_email: 'sender@example.com',
+        topic_key: 'project-alpha',
+        topic_label: 'Project Alpha',
+        anchor_message_id: '<alpha-anchor@canyin.uk>',
+        references_chain: '<alpha-root@canyin.uk>',
+        reply_subject: 'Project Alpha',
+        created_at: '2026-05-15T00:00:00.000Z',
+        updated_at: '2026-05-15T00:00:00.000Z',
+      },
+      {
+        id: 'thread-topic-2',
+        owner_mailbox: 'recipient@example.com',
+        peer_email: 'sender@example.com',
+        topic_key: 'project-beta',
+        topic_label: 'Project Beta',
+        anchor_message_id: '<beta-anchor@canyin.uk>',
+        references_chain: '<beta-root@canyin.uk>',
+        reply_subject: 'Project Beta',
+        created_at: '2026-05-15T00:00:00.000Z',
+        updated_at: '2026-05-15T00:30:00.000Z',
+      },
+    ]
+    const env = {
+      DB: createDirectExternalThreadTrackingMockD1(directExternalEmailThreads),
+      MAILBOX: 'worker@canyin.uk',
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Re: Project Alpha',
+      bodyText: 'Reply to alpha thread',
+      messageId: '<alpha-reply@example.com>',
+      references: '<alpha-root@canyin.uk> <alpha-anchor@canyin.uk>',
+    })
+
+    await worker.email(message, env)
+
+    expect(directExternalEmailThreads).toHaveLength(2)
+    expect(directExternalEmailThreads[0]).toMatchObject({
+      id: 'thread-topic-1',
+      topic_key: 'project-alpha',
+      anchor_message_id: '<alpha-reply@example.com>',
+      references_chain: '<alpha-root@canyin.uk> <alpha-anchor@canyin.uk> <alpha-reply@example.com>',
+      reply_subject: 'Re: Project Alpha',
+    })
+    expect(directExternalEmailThreads[1]).toMatchObject({
+      id: 'thread-topic-2',
+      topic_key: 'project-beta',
+      anchor_message_id: '<beta-anchor@canyin.uk>',
     })
   })
 

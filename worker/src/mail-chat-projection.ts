@@ -6,6 +6,8 @@ const REPLY_SEPARATOR_MARKERS = [
   'Original Email',
   'Replied Message',
   'Forwarded Message',
+  '回复的原邮件',
+  '回复的原邮件信息',
   '原始邮件',
   '原始邮件信息',
   '原邮件',

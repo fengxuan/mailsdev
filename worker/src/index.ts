@@ -103,6 +103,7 @@ interface RealtimeMessagePayload {
   conversation_type: RealtimeConversationType
   group_mailbox: string | null
   sync_mode: RealtimeSyncMode
+  topic?: string | null
   direction: RealtimeNotifyDirection
   text: string
   render_text?: string | null
@@ -110,6 +111,19 @@ interface RealtimeMessagePayload {
   status: 'received' | 'sent' | 'failed'
   sender_email: string | null
   sender_name: string | null
+}
+
+interface DirectExternalEmailThreadRow {
+  id: string
+  owner_mailbox: string
+  peer_email: string
+  topic_key: string
+  topic_label: string | null
+  anchor_message_id: string
+  references_chain: string
+  reply_subject: string | null
+  created_at: string
+  updated_at: string
 }
 
 interface RealtimeNotifyEvent {
@@ -360,6 +374,7 @@ export default {
       mailbox,
       senderMailbox: fromAddress,
       senderName: fromName,
+      subject,
       bodyText: parsed.bodyText,
       bodyHtml: parsed.bodyHtml,
       emailId: id,
@@ -765,6 +780,7 @@ async function handleSend(
           scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
             senderMailbox,
             senderName,
+            subject: body.subject,
             bodyText: body.text,
             bodyHtml: body.html,
             emailId: messageId,
@@ -866,6 +882,7 @@ async function handleSend(
         scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
           senderMailbox,
           senderName: parseFromName(body.from),
+          subject: body.subject,
           bodyText: body.text,
           bodyHtml: body.html,
           emailId: result.id,
@@ -1452,22 +1469,22 @@ async function maybeUpsertDirectExternalEmailThreadFromInbound(
     return
   }
 
-  const existing = await env.DB.prepare(`
-    SELECT id, anchor_message_id, references_chain, reply_subject
+  const existingRows = (await env.DB.prepare(`
+    SELECT id, owner_mailbox, peer_email, topic_key, topic_label, anchor_message_id, references_chain, reply_subject, created_at, updated_at
     FROM direct_external_email_threads
     WHERE owner_mailbox = ? AND peer_email = ?
-    LIMIT 1
-  `).bind(ownerMailbox, peerEmail).first<{
-    id: string
-    anchor_message_id: string
-    references_chain: string
-    reply_subject: string | null
-  }>()
+    ORDER BY updated_at DESC, id DESC
+  `).bind(ownerMailbox, peerEmail).all<DirectExternalEmailThreadRow>()).results ?? []
 
   const normalizedReplySubject = normalizeReplySubject(input.subject)
-  const existingAnchor = normalizeMessageID(existing?.anchor_message_id ?? null)
-  if (existingAnchor === inboundMessageID || isMessageIDInReferencesChain(inboundMessageID, existing?.references_chain ?? '')) {
-    if (existing && normalizedReplySubject && normalizedReplySubject !== (existing.reply_subject ?? null)) {
+  const selectedThread = selectDirectExternalThreadForInbound(existingRows, {
+    inboundMessageID,
+    headers: input.headers,
+    replySubject: normalizedReplySubject,
+  })
+  const existingAnchor = normalizeMessageID(selectedThread?.anchor_message_id ?? null)
+  if (existingAnchor === inboundMessageID || isMessageIDInReferencesChain(inboundMessageID, selectedThread?.references_chain ?? '')) {
+    if (selectedThread && normalizedReplySubject && normalizedReplySubject !== (selectedThread.reply_subject ?? null)) {
       await env.DB.prepare(`
         UPDATE direct_external_email_threads
         SET reply_subject = ?, updated_at = ?
@@ -1475,42 +1492,48 @@ async function maybeUpsertDirectExternalEmailThreadFromInbound(
       `).bind(
         normalizedReplySubject,
         input.receivedAt,
-        existing.id,
+        selectedThread.id,
       ).run()
     }
     return
   }
 
   const inboundReferencesChain = appendMessageIDToReferencesChain(buildNormalizedInboundReferencesChain(
-    existing?.references_chain ?? '',
-    existing?.anchor_message_id ?? '',
+    selectedThread?.references_chain ?? '',
+    selectedThread?.anchor_message_id ?? '',
     input.headers,
   ), inboundMessageID)
+  const topicLabel = deriveTopicLabelFromReplySubject(normalizedReplySubject)
+  const topicKey = selectedThread?.topic_key
+    ?? normalizeTopicKey(topicLabel)
 
-  if (existing) {
+  if (selectedThread) {
     await env.DB.prepare(`
       UPDATE direct_external_email_threads
-      SET anchor_message_id = ?, references_chain = ?, reply_subject = ?, updated_at = ?
+      SET topic_label = ?, anchor_message_id = ?, references_chain = ?, reply_subject = ?, updated_at = ?
       WHERE id = ?
     `).bind(
+      topicLabel,
       inboundMessageID,
       inboundReferencesChain,
       normalizedReplySubject,
       input.receivedAt,
-      existing.id,
+      selectedThread.id,
     ).run()
     return
   }
 
   await env.DB.prepare(`
     INSERT INTO direct_external_email_threads (
-      id, owner_mailbox, peer_email, anchor_message_id, references_chain, reply_subject, created_at, updated_at
+      id, owner_mailbox, peer_email, topic_key, topic_label, anchor_message_id, references_chain, reply_subject, created_at, updated_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).bind(
     crypto.randomUUID(),
     ownerMailbox,
     peerEmail,
+    topicKey,
+    topicLabel,
     inboundMessageID,
     inboundReferencesChain,
     normalizedReplySubject,
@@ -1648,6 +1671,65 @@ function safeJsonParse<T>(value: string | null | undefined, fallback: T): T {
 function normalizeReplySubject(subject: string | null | undefined): string | null {
   const normalized = (subject ?? '').replace(/[\r\n]+/g, ' ').trim()
   return normalized || null
+}
+
+function deriveExternalDirectTopicLabel(env: Env, peer: string, subject: string | null | undefined): string | null {
+  const localDomain = getLocalDomain(env)
+  if (!localDomain) return null
+  if (normalizeMailbox(peer).endsWith(`@${localDomain}`)) {
+    return null
+  }
+  return deriveTopicLabelFromReplySubject(subject)
+}
+
+function deriveTopicLabelFromReplySubject(subject: string | null | undefined): string | null {
+  const normalized = normalizeReplySubject(subject)
+  if (!normalized) return null
+  return normalized.replace(/^(?:re|fw|fwd)\s*:\s*/i, '').trim() || normalized
+}
+
+function normalizeTopicKey(value: string | null | undefined): string {
+  const normalized = (value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/^#+/, '')
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/^-+|-+$/g, '')
+  return normalized || 'default'
+}
+
+function selectDirectExternalThreadForInbound(
+  rows: DirectExternalEmailThreadRow[],
+  input: {
+    inboundMessageID: string
+    headers: Record<string, string>
+    replySubject: string | null
+  },
+): DirectExternalEmailThreadRow | null {
+  if (rows.length === 0) {
+    return null
+  }
+
+  const inboundTokens = parseMessageIDList(normalizeReferencesChain([
+    getHeaderValueCaseInsensitive(input.headers, 'References'),
+    getHeaderValueCaseInsensitive(input.headers, 'In-Reply-To'),
+    input.inboundMessageID,
+  ].join(' ')))
+  const inboundSet = new Set(inboundTokens)
+
+  const ancestryMatch = rows.find((row) => {
+    const rowTokens = parseMessageIDList(buildReferencesHeader(row.references_chain, row.anchor_message_id))
+    if (rowTokens.length === 0 || inboundTokens.length === 0) {
+      return false
+    }
+    return rowTokens.some((token) => inboundSet.has(token))
+  })
+  if (ancestryMatch) {
+    return ancestryMatch
+  }
+
+  const topicKey = normalizeTopicKey(deriveTopicLabelFromReplySubject(input.replySubject))
+  return rows.find((row) => row.topic_key === topicKey) ?? null
 }
 
 function getHeaderValueCaseInsensitive(headers: Record<string, string>, name: string): string {
@@ -1899,6 +1981,7 @@ function scheduleRealtimeNotifyForIncomingMailbox(
     mailbox: string
     senderMailbox: string
     senderName?: string | null
+    subject?: string | null
     bodyText?: string
     bodyHtml?: string
     emailId?: string
@@ -1917,6 +2000,7 @@ function scheduleRealtimeNotifyForIncomingMailbox(
         mailbox: input.mailbox,
         senderMailbox: input.senderMailbox,
         senderName: input.senderName,
+        subject: input.subject,
         bodyText: input.bodyText,
         bodyHtml: input.bodyHtml,
         emailId: input.emailId,
@@ -1944,6 +2028,7 @@ function scheduleRealtimeNotifyForDirectOutboundSender(
   input: {
     senderMailbox: string
     senderName?: string | null
+    subject?: string | null
     bodyText?: string
     bodyHtml?: string
     emailId?: string
@@ -2105,6 +2190,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
     mailbox: string
     senderMailbox: string
     senderName?: string | null
+    subject?: string | null
     bodyText?: string
     bodyHtml?: string
     emailId?: string
@@ -2190,8 +2276,10 @@ async function resolveRealtimeEventsForIncomingMailbox(
       conversationType: 'direct',
       syncMode: 'mail',
       ...buildRealtimeDirectPayloadEventFieldsForInboundEmail({
+        env,
         peer: normalizedSenderMailbox,
         emailId: input.emailId,
+        subject: input.subject,
         senderName: nonEmptyTrimmed(input.senderName) ?? null,
         bodyText: input.bodyText,
         bodyHtml: input.bodyHtml,
@@ -2204,6 +2292,9 @@ async function resolveRealtimeEventsForIncomingMailbox(
   const latestProjection = latestEmail
     ? buildRealtimeMessageProjection(latestEmail.body_text, latestEmail.body_html)
     : EMPTY_REALTIME_MESSAGE_PROJECTION
+  const latestTopic = latestEmail
+    ? deriveExternalDirectTopicLabel(env, normalizedSenderMailbox, latestEmail.subject)
+    : null
 
   return [{
     targetUserId: directUserId,
@@ -2238,6 +2329,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
             conversation_type: 'direct',
             group_mailbox: null,
             sync_mode: 'mail',
+            ...(latestTopic ? { topic: latestTopic } : {}),
             direction: 'inbound',
             text: latestProjection.text,
             ...(latestProjection.renderText ? { render_text: latestProjection.renderText } : {}),
@@ -2256,6 +2348,7 @@ async function resolveRealtimeEventForDirectOutboundSender(
   input: {
     senderMailbox: string
     senderName?: string | null
+    subject?: string | null
     bodyText?: string
     bodyHtml?: string
     emailId?: string
@@ -2281,10 +2374,12 @@ async function resolveRealtimeEventForDirectOutboundSender(
       conversationType: 'direct',
       syncMode: 'mail',
       ...buildRealtimeDirectPayloadEventFieldsForOutboundEmail({
+        env,
         peer: normalizedPeerMailbox,
         emailId: input.emailId,
         senderMailbox: normalizedSenderMailbox,
         senderName: nonEmptyTrimmed(input.senderName) ?? null,
+        subject: input.subject,
         bodyText: input.bodyText,
         bodyHtml: input.bodyHtml,
         receivedAt: input.receivedAt,
@@ -2329,6 +2424,7 @@ async function resolveRealtimeEventForDirectOutboundSender(
         conversation_type: 'direct',
         group_mailbox: null,
         sync_mode: 'mail',
+        topic: deriveTopicLabelFromReplySubject(latestEmail.subject),
         direction: 'outbound',
         text: latestProjection.text,
         ...(latestProjection.renderText ? { render_text: latestProjection.renderText } : {}),
@@ -2417,6 +2513,7 @@ async function getLatestDirectConversationEmail(
 ): Promise<{
   id: string
   from_name: string | null
+  subject: string | null
   body_text: string
   body_html: string
   status: 'received' | 'sent' | 'failed' | 'queued'
@@ -2424,7 +2521,7 @@ async function getLatestDirectConversationEmail(
 } | null> {
   try {
     const row = await env.DB.prepare(`
-      SELECT id, from_name, body_text, body_html, status, received_at
+      SELECT id, from_name, subject, body_text, body_html, status, received_at
       FROM emails
       WHERE mailbox = ?
         AND (
@@ -2437,6 +2534,7 @@ async function getLatestDirectConversationEmail(
     `).bind(mailbox, peer, peer, peer).first<{
       id: string
       from_name: string | null
+      subject: string | null
       body_text: string
       body_html: string
       status: 'received' | 'sent' | 'failed' | 'queued'
@@ -2554,14 +2652,17 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
 }
 
 function buildRealtimeDirectPayloadEventFieldsForInboundEmail(input: {
+  env: Env
   peer: string
   emailId: string
+  subject?: string | null
   senderName: string | null
   bodyText?: string
   bodyHtml?: string
   receivedAt: string
 }): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
   const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
+  const topic = deriveExternalDirectTopicLabel(input.env, input.peer, input.subject)
 
   return {
     conversation: {
@@ -2586,6 +2687,7 @@ function buildRealtimeDirectPayloadEventFieldsForInboundEmail(input: {
       conversation_type: 'direct',
       group_mailbox: null,
       sync_mode: 'mail',
+      ...(topic ? { topic } : {}),
       direction: 'inbound',
       text: projection.text,
       ...(projection.renderText ? { render_text: projection.renderText } : {}),
@@ -2598,16 +2700,19 @@ function buildRealtimeDirectPayloadEventFieldsForInboundEmail(input: {
 }
 
 function buildRealtimeDirectPayloadEventFieldsForOutboundEmail(input: {
+  env: Env
   peer: string
   emailId: string
   senderMailbox: string
   senderName: string | null
+  subject?: string | null
   bodyText?: string
   bodyHtml?: string
   receivedAt: string
   status: 'sent' | 'failed'
 }): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
   const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
+  const topic = deriveExternalDirectTopicLabel(input.env, input.peer, input.subject)
 
   return {
     conversation: {
@@ -2632,6 +2737,7 @@ function buildRealtimeDirectPayloadEventFieldsForOutboundEmail(input: {
       conversation_type: 'direct',
       group_mailbox: null,
       sync_mode: 'mail',
+      ...(topic ? { topic } : {}),
       direction: 'outbound',
       text: projection.text,
       ...(projection.renderText ? { render_text: projection.renderText } : {}),

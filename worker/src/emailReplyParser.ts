@@ -56,6 +56,7 @@ const QUOTE_HEADER_REGEXES = [
   /^-{1,12} ?(O|o)prindelig (B|b)esked ?-{1,12}$/i,
   /^-{1,12} ?(M|m)essage d'origine ?-{1,12}$/i,
   /^-{1,12} ?(U|u)rsprüngliche (N|n)achricht ?-{0,12}$/i,
+  /^[-_\s]{2,}回\s*复(?:\s*的)?\s*原\s*邮\s*件(?:\s*信\s*息)?\s*[-_\s]{2,}$/i,
   /^At\s.+wrote:\s*$/i,
   /^At\s.+,\s*[^\s<>@]+@[^\s<>]+\s+wrote:\s*$/i,
   /^.+<[^>]+>\s*于.+写道：\s*$/i,
