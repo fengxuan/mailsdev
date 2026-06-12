@@ -1490,7 +1490,6 @@ async function maybeUpsertDirectExternalEmailThreadFromInbound(
   const selectedThread = selectDirectExternalThreadForInbound(existingRows, {
     inboundMessageID,
     headers: input.headers,
-    replySubject: normalizedReplySubject,
   })
   const existingAnchor = normalizeMessageID(selectedThread?.anchor_message_id ?? null)
   if (existingAnchor === inboundMessageID || isMessageIDInReferencesChain(inboundMessageID, selectedThread?.references_chain ?? '')) {
@@ -1520,10 +1519,9 @@ async function maybeUpsertDirectExternalEmailThreadFromInbound(
   if (selectedThread) {
     await env.DB.prepare(`
       UPDATE direct_external_email_threads
-      SET topic_label = ?, anchor_message_id = ?, references_chain = ?, reply_subject = ?, updated_at = ?
+      SET anchor_message_id = ?, references_chain = ?, reply_subject = ?, updated_at = ?
       WHERE id = ?
     `).bind(
-      topicLabel,
       inboundMessageID,
       inboundReferencesChain,
       normalizedReplySubject,
@@ -1717,7 +1715,6 @@ function selectDirectExternalThreadForInbound(
   input: {
     inboundMessageID: string
     headers: Record<string, string>
-    replySubject: string | null
   },
 ): DirectExternalEmailThreadRow | null {
   if (rows.length === 0) {
@@ -1741,18 +1738,7 @@ function selectDirectExternalThreadForInbound(
   if (ancestryMatch) {
     return ancestryMatch
   }
-
-  const topicLabel = deriveTopicLabelFromReplySubject(input.replySubject)
-  if (!topicLabel) {
-    return null
-  }
-
-  const topicKey = normalizeTopicKey(topicLabel)
-  if (topicKey === 'default') {
-    return null
-  }
-
-  return rows.find((row) => row.topic_key === topicKey) ?? null
+  return null
 }
 
 function getHeaderValueCaseInsensitive(headers: Record<string, string>, name: string): string {

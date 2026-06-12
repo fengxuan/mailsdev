@@ -1911,13 +1911,12 @@ function createDirectExternalThreadTrackingMockD1(directExternalEmailThreads: Di
             first: mock(() => Promise.resolve(null)),
             all: mock(() => Promise.resolve({ results: [] })),
             run: mock(() => {
-              const existing = directExternalEmailThreads.find((row) => row.id === String(params[5]))
+              const existing = directExternalEmailThreads.find((row) => row.id === String(params[4]))
               if (existing) {
-                existing.topic_label = params[0] === null ? null : String(params[0])
-                existing.anchor_message_id = String(params[1])
-                existing.references_chain = String(params[2])
-                existing.reply_subject = params[3] === null ? null : String(params[3])
-                existing.updated_at = String(params[4])
+                existing.anchor_message_id = String(params[0])
+                existing.references_chain = String(params[1])
+                existing.reply_subject = params[2] === null ? null : String(params[2])
+                existing.updated_at = String(params[3])
               }
               return Promise.resolve({ success: true })
             }),
@@ -2126,6 +2125,46 @@ describe('worker: inbound direct external thread tracking', () => {
       anchor_message_id: '<work-reply@example.com>',
       references_chain: '<work-root@canyin.uk> <work-anchor@canyin.uk> <work-reply@example.com>',
       reply_subject: 'Re: Re: work',
+    })
+  })
+
+  test('inbound external reply keeps stored topic label stable when latest subject changes', async () => {
+    const directExternalEmailThreads: DirectExternalEmailThreadRow[] = [{
+      id: 'thread-topic-trip-1',
+      owner_mailbox: 'recipient@example.com',
+      peer_email: 'sender@example.com',
+      topic_key: 'trip',
+      topic_label: 'Trip',
+      anchor_message_id: '<trip-anchor@canyin.uk>',
+      references_chain: '<trip-root@canyin.uk>',
+      reply_subject: 'Trip',
+      created_at: '2026-05-15T00:00:00.000Z',
+      updated_at: '2026-05-15T00:00:00.000Z',
+    }]
+    const env = {
+      DB: createDirectExternalThreadTrackingMockD1(directExternalEmailThreads),
+      MAILBOX: 'worker@canyin.uk',
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Re: Trip status',
+      bodyText: 'Reply to the same trip thread',
+      messageId: '<trip-reply-status@example.com>',
+      references: '<trip-root@canyin.uk> <trip-anchor@canyin.uk>',
+    })
+
+    await worker.email(message, env)
+
+    expect(directExternalEmailThreads).toHaveLength(1)
+    expect(directExternalEmailThreads[0]).toMatchObject({
+      id: 'thread-topic-trip-1',
+      topic_key: 'trip',
+      topic_label: 'Trip',
+      anchor_message_id: '<trip-reply-status@example.com>',
+      references_chain: '<trip-root@canyin.uk> <trip-anchor@canyin.uk> <trip-reply-status@example.com>',
+      reply_subject: 'Re: Trip status',
     })
   })
 
