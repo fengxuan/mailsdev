@@ -1310,13 +1310,22 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   const since = url.searchParams.get('since') || '1970-01-01T00:00:00Z'
   const peer = optionalPeer(url.searchParams.get('peer'))
   const before = optionalIsoTime(url.searchParams.get('before'))
+  const sinceId = optionalCursorId(url.searchParams.get('since_id'))
   const beforeId = optionalCursorId(url.searchParams.get('before_id'))
   const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '100'), 500)
   const offset = parseInt(url.searchParams.get('offset') ?? '0')
   const direction = url.searchParams.get('direction')
 
-  const whereParts = ['mailbox = ?', 'received_at > ?']
-  const params: Array<string | number> = [authorizedMailbox, since]
+  const whereParts = ['mailbox = ?']
+  const params: Array<string | number> = [authorizedMailbox]
+
+  if (sinceId) {
+    whereParts.push('(received_at > ? OR (received_at = ? AND id > ?))')
+    params.push(since, since, sinceId)
+  } else {
+    whereParts.push('received_at > ?')
+    params.push(since)
+  }
 
   if (peer) {
     whereParts.push(`(
@@ -1728,7 +1737,16 @@ function selectDirectExternalThreadForInbound(
     return ancestryMatch
   }
 
-  const topicKey = normalizeTopicKey(deriveTopicLabelFromReplySubject(input.replySubject))
+  const topicLabel = deriveTopicLabelFromReplySubject(input.replySubject)
+  if (!topicLabel) {
+    return null
+  }
+
+  const topicKey = normalizeTopicKey(topicLabel)
+  if (topicKey === 'default') {
+    return null
+  }
+
   return rows.find((row) => row.topic_key === topicKey) ?? null
 }
 
