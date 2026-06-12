@@ -157,6 +157,7 @@ interface LocalDeliveryClassification {
 interface IndexedGroupRealtimeMessageRef {
   groupId: string
   groupMailbox: string
+  groupName: string | null
   syncMode: 'mail' | 'fast_chat'
   emailId: string
   senderEmail: string
@@ -1107,6 +1108,7 @@ async function maybeUpsertChatGroupMessageIndex(
     return {
       groupId: group.id,
       groupMailbox: group.mailbox,
+      groupName: group.name,
       syncMode: group.sync_mode,
       emailId: input.emailId,
       senderEmail,
@@ -1135,6 +1137,7 @@ async function maybeUpsertChatGroupMessageIndex(
   return {
     groupId: group.id,
     groupMailbox: group.mailbox,
+    groupName: group.name,
     syncMode: group.sync_mode,
     emailId: input.emailId,
     senderEmail,
@@ -1711,6 +1714,21 @@ function normalizeTopicKey(value: string | null | undefined): string {
   return normalized || 'default'
 }
 
+function deriveVisibleGroupTopicLabel(
+  subject: string | null | undefined,
+  groupName?: string | null,
+): string | null {
+  const normalizedSubject = deriveTopicLabelFromReplySubject(subject)
+  if (!normalizedSubject) return null
+  const normalizedKey = normalizeTopicKey(normalizedSubject)
+  if (normalizedKey === normalizeTopicKey('Chatgroup')) return null
+  const normalizedGroupName = groupName?.trim()
+  if (normalizedGroupName && normalizedKey === normalizeTopicKey(normalizedGroupName)) {
+    return null
+  }
+  return normalizedSubject
+}
+
 function selectDirectExternalThreadForInbound(
   rows: DirectExternalEmailThreadRow[],
   input: {
@@ -2215,6 +2233,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
     ? {
         id: input.currentGroupMessage.groupId,
         mailbox: normalizeMailbox(input.currentGroupMessage.groupMailbox),
+        name: input.currentGroupMessage.groupName,
         sync_mode: input.currentGroupMessage.syncMode,
       }
     : await getActiveChatGroupByMailbox(env, normalizedMailbox)
@@ -2461,18 +2480,19 @@ async function isDirectConversationRecipientMailbox(env: Env, mailbox: string): 
 async function getActiveChatGroupByMailbox(
   env: Env,
   mailbox: string,
-): Promise<{ id: string; mailbox: string; sync_mode: 'mail' | 'fast_chat' } | null> {
+): Promise<{ id: string; mailbox: string; name: string | null; sync_mode: 'mail' | 'fast_chat' } | null> {
   try {
     const group = await env.DB.prepare(`
-      SELECT id, mailbox, sync_mode
+      SELECT id, mailbox, name, sync_mode
       FROM chat_groups
       WHERE mailbox = ? AND status = 'active'
       LIMIT 1
-    `).bind(normalizeMailbox(mailbox)).first<{ id: string; mailbox: string; sync_mode: 'mail' | 'fast_chat' }>()
+    `).bind(normalizeMailbox(mailbox)).first<{ id: string; mailbox: string; name: string | null; sync_mode: 'mail' | 'fast_chat' }>()
     if (!group) return null
     return {
       id: group.id,
       mailbox: normalizeMailbox(group.mailbox),
+      name: group.name ?? null,
       sync_mode: group.sync_mode,
     }
   } catch (error) {
@@ -2565,7 +2585,7 @@ function extractRealtimeMessageText(bodyText: string | null | undefined, bodyHtm
 }
 
 function buildRealtimeGroupPayloadEventFields(input: {
-  group: { mailbox: string; sync_mode: 'mail' | 'fast_chat' }
+  group: { mailbox: string; name: string | null; sync_mode: 'mail' | 'fast_chat' }
   memberMailbox: string
   latestMessage: {
     email_id: string
@@ -2617,7 +2637,7 @@ function buildRealtimeGroupPayloadEventFields(input: {
 }
 
 function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
-  group: { mailbox: string; sync_mode: 'mail' | 'fast_chat' }
+  group: { mailbox: string; name: string | null; sync_mode: 'mail' | 'fast_chat' }
   memberMailbox: string
   emailId: string
   senderMailbox: string
@@ -2633,7 +2653,7 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
       : 'inbound'
   const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
   const senderMailbox = normalizeMailbox(input.senderMailbox)
-  const topic = deriveTopicLabelFromReplySubject(input.subject)
+  const topic = deriveVisibleGroupTopicLabel(input.subject, input.group.name)
 
   return {
     conversation: {
