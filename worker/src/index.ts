@@ -68,6 +68,7 @@ interface AccessTokenClaims {
 interface ConversationSummaryRow {
   peer_address: string
   id: string
+  to_address: string
   direction: 'inbound' | 'outbound'
   status: 'received' | 'sent' | 'failed' | 'queued'
   body_text: string
@@ -526,7 +527,7 @@ async function handleConversations(url: URL, env: Env, authorizedMailbox: string
       WHERE e.mailbox = ?
         ${beforeFilter}
     )
-    SELECT peer_address, id, direction, status, body_text, body_html, received_at
+    SELECT peer_address, id, to_address, direction, status, body_text, body_html, received_at
     FROM ranked
     WHERE row_num = 1
     ORDER BY received_at DESC, id DESC
@@ -538,6 +539,7 @@ async function handleConversations(url: URL, env: Env, authorizedMailbox: string
       peer: row.peer_address,
       email: {
         id: row.id,
+        to_address: row.to_address,
         direction: row.direction,
         status: row.status,
         body_text: row.body_text,
