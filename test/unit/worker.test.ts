@@ -2548,6 +2548,49 @@ describe('worker: GET /api/inbox and /api/code', () => {
     expect(json.emails[0]!.code).toBe('114669')
   })
 
+  test('inbox hides later duplicate retries for the same message_id', async () => {
+    let capturedSql = ''
+    const original = makeSyncEmail({
+      id: 'orig-e1',
+      subject: 'Original message',
+      message_id: '<dup-inbox@test.com>',
+      received_at: '2026-03-19T10:00:00Z',
+    })
+    const duplicateRetry = makeSyncEmail({
+      id: 'dup-e1',
+      subject: 'Duplicate retry',
+      message_id: '<dup-inbox@test.com>',
+      received_at: '2026-03-19T11:00:00Z',
+    })
+    const db = {
+      prepare: mock((sql: string) => {
+        capturedSql = sql
+        return {
+          bind: mock(() => ({
+            all: mock(() => Promise.resolve({
+              results: sql.includes('FROM canonical_emails')
+                ? [original]
+                : [duplicateRetry, original],
+            })),
+          })),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = singleMailboxEnv('user@test.com', { DB: db })
+    const response = await worker.fetch(
+      authedRequest('http://localhost/api/inbox?to=user@test.com'),
+      env,
+    )
+    const json = await response.json() as { emails: Array<{ id: string; subject: string }> }
+
+    expect(response.status).toBe(200)
+    expect(capturedSql).toContain('FROM canonical_emails')
+    expect(json.emails).toHaveLength(1)
+    expect(json.emails[0]?.id).toBe('orig-e1')
+    expect(json.emails[0]?.subject).toBe('Original message')
+  })
+
   test('recomputes polled code from html-only body when stored code is stale', async () => {
     const db = {
       prepare: mock(() => ({
@@ -2577,6 +2620,54 @@ describe('worker: GET /api/inbox and /api/code', () => {
     const json = await response.json() as { code: string | null }
 
     expect(response.status).toBe(200)
+    expect(json.code).toBe('114669')
+  })
+
+  test('polled code ignores later duplicate retries for the same message_id', async () => {
+    let capturedSql = ''
+    const original = makeSyncEmail({
+      id: 'orig-code',
+      subject: 'OTP Code',
+      body_text: 'Your verification code is 114669',
+      body_html: '',
+      code: '114669',
+      message_id: '<dup-code@test.com>',
+      received_at: '2026-03-19T10:00:00Z',
+    })
+    const duplicateRetry = makeSyncEmail({
+      id: 'dup-code',
+      subject: 'OTP Code',
+      body_text: 'Your verification code is 114669',
+      body_html: '',
+      code: '114669',
+      message_id: '<dup-code@test.com>',
+      received_at: '2026-03-19T11:00:00Z',
+    })
+    const db = {
+      prepare: mock((sql: string) => {
+        capturedSql = sql
+        return {
+          bind: mock(() => ({
+            all: mock(() => Promise.resolve({
+              results: sql.includes('FROM canonical_emails')
+                ? [original]
+                : [duplicateRetry, original],
+            })),
+          })),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = singleMailboxEnv('user@test.com', { DB: db })
+    const response = await worker.fetch(
+      authedRequest('http://localhost/api/code?to=user@test.com&since=2026-03-19T09:30:00Z&timeout=1'),
+      env,
+    )
+    const json = await response.json() as { id: string; code: string | null }
+
+    expect(response.status).toBe(200)
+    expect(capturedSql).toContain('FROM canonical_emails')
+    expect(json.id).toBe('orig-code')
     expect(json.code).toBe('114669')
   })
 

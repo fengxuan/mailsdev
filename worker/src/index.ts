@@ -410,9 +410,15 @@ async function handleGetCode(url: URL, env: Env, authorizedMailbox: string): Pro
   const timeoutSec = Math.min(parseInt(url.searchParams.get('timeout') ?? '30'), 55)
   const since = url.searchParams.get('since')
   const deadline = Date.now() + timeoutSec * 1000
+  const canonicalEmailsCte = buildCanonicalEmailsCte('e', "e.direction = 'inbound'")
 
   while (Date.now() < deadline) {
-    let query = 'SELECT id, code, from_address, subject, body_text, body_html, received_at FROM emails WHERE mailbox = ?'
+    let query = `
+      ${canonicalEmailsCte}
+      SELECT id, code, from_address, subject, body_text, body_html, received_at
+      FROM canonical_emails
+      WHERE 1 = 1
+    `
     const params: string[] = [authorizedMailbox]
 
     if (since) {
@@ -420,7 +426,7 @@ async function handleGetCode(url: URL, env: Env, authorizedMailbox: string): Pro
       params.push(since)
     }
 
-    query += ' ORDER BY received_at DESC LIMIT 50'
+    query += ' ORDER BY received_at DESC, id DESC LIMIT 50'
 
     const rows = await env.DB.prepare(query).bind(...params).all<{
       id: string
@@ -462,11 +468,14 @@ async function handleInbox(url: URL, env: Env, authorizedMailbox: string): Promi
   const offset = parseInt(url.searchParams.get('offset') ?? '0', 10) || 0
   const direction = url.searchParams.get('direction')
   const query = url.searchParams.get('query')?.trim()
+  const canonicalEmailsCte = buildCanonicalEmailsCte()
 
   let sql = `
+    ${canonicalEmailsCte}
     SELECT id, mailbox, from_address, from_name, subject, body_text, body_html, code,
            direction, status, provider, received_at, has_attachments, attachment_count
-    FROM emails WHERE mailbox = ?`
+    FROM canonical_emails
+    WHERE 1 = 1`
   const params: (string | number)[] = [authorizedMailbox]
 
   if (direction === 'inbound' || direction === 'outbound') {
@@ -480,7 +489,7 @@ async function handleInbox(url: URL, env: Env, authorizedMailbox: string): Promi
     params.push(pattern, pattern, pattern, pattern, pattern)
   }
 
-  sql += ' ORDER BY received_at DESC LIMIT ? OFFSET ?'
+  sql += ' ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?'
   params.push(limit, offset)
 
   const rows = await env.DB.prepare(sql).bind(...params).all()
@@ -1290,7 +1299,7 @@ function canonicalEmailPartitionKey(tableAlias: string): string {
   END`
 }
 
-function buildCanonicalEmailsCte(tableAlias = 'e'): string {
+function buildCanonicalEmailsCte(tableAlias = 'e', extraWhere = ''): string {
   return `
     WITH canonical_emails AS (
       SELECT * FROM (
@@ -1302,6 +1311,7 @@ function buildCanonicalEmailsCte(tableAlias = 'e'): string {
           ) AS canonical_row_num
         FROM emails ${tableAlias}
         WHERE ${tableAlias}.mailbox = ?
+          ${extraWhere ? `AND ${extraWhere}` : ''}
       )
       WHERE canonical_row_num = 1
     )
@@ -2727,10 +2737,10 @@ async function getLatestDirectConversationEmail(
 } | null> {
   try {
     const row = await env.DB.prepare(`
+      ${buildCanonicalEmailsCte()}
       SELECT id, from_name, subject, body_text, body_html, status, received_at
-      FROM emails
-      WHERE mailbox = ?
-        AND (
+      FROM canonical_emails
+      WHERE (
           peer_address = ?
           OR (peer_address IS NULL AND direction = 'inbound' AND lower(trim(from_address)) = ?)
           OR (peer_address IS NULL AND direction = 'outbound' AND instr(to_address, ',') = 0 AND lower(trim(to_address)) = ?)
