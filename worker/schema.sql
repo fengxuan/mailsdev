@@ -141,6 +141,19 @@ CREATE TABLE IF NOT EXISTS deleted_mailboxes (
   created_by TEXT
 );
 
+CREATE TABLE IF NOT EXISTS direct_external_email_threads (
+  id TEXT PRIMARY KEY,
+  owner_mailbox TEXT NOT NULL,
+  peer_email TEXT NOT NULL,
+  topic_key TEXT NOT NULL DEFAULT 'default',
+  topic_label TEXT,
+  anchor_message_id TEXT NOT NULL,
+  references_chain TEXT NOT NULL DEFAULT '',
+  reply_subject TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_emails_mailbox ON emails(mailbox, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_emails_peer ON emails(mailbox, peer_address, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_emails_code ON emails(mailbox) WHERE code IS NOT NULL;
@@ -153,6 +166,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_users_mailbox ON users(mailbox);
 CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_identities_provider_subject ON user_identities(provider, provider_subject);
 CREATE INDEX IF NOT EXISTS idx_user_identities_user ON user_identities(user_id, provider);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_direct_external_email_threads_owner_peer_topic
+  ON direct_external_email_threads(owner_mailbox, peer_email, topic_key);
+CREATE INDEX IF NOT EXISTS idx_direct_external_email_threads_owner_peer_updated
+  ON direct_external_email_threads(owner_mailbox, peer_email, updated_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_challenges_user_expires ON email_verification_challenges(user_id, expires_at DESC);
 CREATE INDEX IF NOT EXISTS idx_challenges_email_consumed ON email_verification_challenges(email, consumed_at, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash);
