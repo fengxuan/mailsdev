@@ -4,6 +4,8 @@
   "scripts": {
     "dev": "wrangler dev --port 3160",
     "deploy": "wrangler deploy",
+    "check": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
     "db:create": "wrangler d1 create mails",
     "db:schema": "wrangler d1 execute mails --file=schema.sql",
     "db:schema:local": "wrangler d1 execute mails --local --file=schema.sql",
@@ -11,6 +13,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4",
+    "typescript": "^5.9.3",
     "wrangler": "^4"
   },
   "dependencies": {
