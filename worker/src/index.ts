@@ -2700,6 +2700,10 @@ function extractRealtimeMessageText(bodyText: string | null | undefined, bodyHtm
   return buildRealtimeMessageProjection(bodyText, bodyHtml).text
 }
 
+function preferredRealtimeGroupTitle(group: { mailbox: string; name: string | null }): string {
+  return nonEmptyTrimmed(group.name) ?? group.mailbox
+}
+
 function buildRealtimeGroupPayloadEventFields(input: {
   group: { mailbox: string; name: string | null; sync_mode: 'mail' | 'fast_chat' }
   memberMailbox: string
@@ -2717,14 +2721,15 @@ function buildRealtimeGroupPayloadEventFields(input: {
     normalizeMailbox(input.memberMailbox) === normalizeMailbox(input.latestMessage.sender_email)
       ? 'outbound'
       : 'inbound'
+  const groupTitle = preferredRealtimeGroupTitle(input.group)
   return {
     conversation: {
       peer: input.group.mailbox,
       conversation_type: 'group',
       group_mailbox: input.group.mailbox,
       sync_mode: input.group.sync_mode,
-      title: input.group.mailbox,
-      peer_display_name: input.group.mailbox,
+      title: groupTitle,
+      peer_display_name: groupTitle,
       peer_alias: null,
       last_message: input.latestMessage.text,
       ...(input.latestMessage.render_text ? { last_render_text: input.latestMessage.render_text } : {}),
@@ -2770,6 +2775,7 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
   const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
   const senderMailbox = normalizeMailbox(input.senderMailbox)
   const topic = deriveVisibleGroupTopicLabel(input.subject, input.group.name)
+  const groupTitle = preferredRealtimeGroupTitle(input.group)
 
   return {
     conversation: {
@@ -2777,8 +2783,8 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
       conversation_type: 'group',
       group_mailbox: input.group.mailbox,
       sync_mode: input.group.sync_mode,
-      title: input.group.mailbox,
-      peer_display_name: input.group.mailbox,
+      title: groupTitle,
+      peer_display_name: groupTitle,
       peer_alias: null,
       last_message: projection.text,
       ...(projection.renderText ? { last_render_text: projection.renderText } : {}),
