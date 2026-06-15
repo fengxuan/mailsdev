@@ -2244,24 +2244,28 @@ function createSyncMockD1(options: {
   const { total = 1, emailRows, attachmentRows } = options
   const defaultEmails = emailRows ?? [makeSyncEmail()]
   const defaultAttachments = attachmentRows ?? defaultEmails.map(() => [])
-
-  let callIndex = 0
-  const prepareMock = mock((_sql: string) => {
-    const currentCall = callIndex++
+  const prepareMock = mock((sql: string) => {
     return {
-      bind: mock((..._args: unknown[]) => ({
+      bind: mock((...args: unknown[]) => ({
         first: mock(() => {
-          // First call is the COUNT query
+          if (!sql.includes('COUNT(*) as total')) {
+            return Promise.resolve(null)
+          }
           return Promise.resolve({ total })
         }),
         all: mock(() => {
-          if (currentCall === 1) {
-            // Second call: SELECT * FROM emails
+          if (sql.includes('SELECT * FROM emails')) {
             return Promise.resolve({ results: defaultEmails })
           }
-          // Subsequent calls: SELECT * FROM attachments for each email
-          const attachmentIndex = currentCall - 2
-          return Promise.resolve({ results: defaultAttachments[attachmentIndex] ?? [] })
+          if (sql.includes('FROM attachments') && sql.includes('email_id IN')) {
+            return Promise.resolve({ results: defaultAttachments.flat() })
+          }
+          if (sql.includes('FROM attachments WHERE email_id = ?')) {
+            const emailID = args[0] as string
+            const attachmentIndex = defaultEmails.findIndex((row) => row.id === emailID)
+            return Promise.resolve({ results: defaultAttachments[attachmentIndex] ?? [] })
+          }
+          return Promise.resolve({ results: [] })
         }),
       })),
     }
@@ -2640,6 +2644,54 @@ describe('worker: GET /api/sync', () => {
     expect(response.status).toBe(200)
     expect(json.total).toBe(150)
     expect(json.has_more).toBe(true)
+  })
+
+  test('skip_total avoids count queries and batches attachment reads', async () => {
+    const email1 = makeSyncEmail({ id: 'sync-e1', has_attachments: 1, attachment_count: 1 })
+    const email2 = makeSyncEmail({ id: 'sync-e2', subject: 'Second email', received_at: '2026-03-19T11:00:00Z' })
+    const attachment = makeSyncAttachment({ email_id: 'sync-e1' })
+    const capturedSqls: string[] = []
+    const capturedBinds: Array<{ sql: string; args: unknown[] }> = []
+    const db = {
+      prepare: mock((sql: string) => {
+        capturedSqls.push(sql)
+        return {
+          bind: mock((...args: unknown[]) => {
+            capturedBinds.push({ sql, args })
+            return {
+              first: mock(() => Promise.resolve({ total: 999 })),
+              all: mock(() => {
+                if (sql.includes('SELECT * FROM emails')) {
+                  return Promise.resolve({ results: [email1, email2] })
+                }
+                if (sql.includes('FROM attachments') && sql.includes('email_id IN')) {
+                  return Promise.resolve({ results: [attachment] })
+                }
+                return Promise.resolve({ results: [] })
+              }),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = singleMailboxEnv('user@test.com', { DB: db })
+    const response = await worker.fetch(
+      authedRequest('http://localhost/api/sync?to=user@test.com&skip_total=1&limit=1'),
+      env,
+    )
+    const json = await response.json() as { emails: any[]; total: number; has_more: boolean }
+
+    expect(response.status).toBe(200)
+    expect(json.emails).toHaveLength(1)
+    expect(json.emails[0].attachments).toHaveLength(1)
+    expect(json.has_more).toBe(true)
+    expect(json.total).toBe(2)
+    expect(capturedSqls.some((sql) => sql.includes('COUNT(*) as total'))).toBe(false)
+    expect(capturedSqls.some((sql) => sql.includes('FROM attachments') && sql.includes('email_id IN'))).toBe(true)
+    expect(capturedSqls.some((sql) => sql.includes('FROM attachments WHERE email_id = ?'))).toBe(false)
+    const attachmentBind = capturedBinds.find((entry) => entry.sql.includes('FROM attachments') && entry.sql.includes('email_id IN'))
+    expect(attachmentBind?.args).toEqual(['sync-e1'])
   })
 
   test('falls back to from/to matching when peer_address is null', async () => {

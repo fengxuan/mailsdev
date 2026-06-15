@@ -1320,6 +1320,7 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '100'), 500)
   const offset = parseInt(url.searchParams.get('offset') ?? '0')
   const direction = url.searchParams.get('direction')
+  const skipTotal = url.searchParams.get('skip_total') === '1'
 
   const whereParts = ['mailbox = ?']
   const params: Array<string | number> = [authorizedMailbox]
@@ -1357,37 +1358,66 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   }
 
   const whereClause = whereParts.join(' AND ')
-
-  const countRow = await env.DB.prepare(
-    `SELECT COUNT(*) as total FROM emails WHERE ${whereClause}`
-  ).bind(...params).first<{ total: number }>()
-  const total = countRow?.total ?? 0
+  const total = skipTotal
+    ? null
+    : (await env.DB.prepare(
+      `SELECT COUNT(*) as total FROM emails WHERE ${whereClause}`
+    ).bind(...params).first<{ total: number }>())?.total ?? 0
 
   const orderBy = peer
     ? 'received_at DESC, id DESC'
     : 'received_at ASC, id ASC'
+  const queryLimit = skipTotal ? limit + 1 : limit
 
   const rows = await env.DB.prepare(`
     SELECT * FROM emails
     WHERE ${whereClause}
     ORDER BY ${orderBy}
     LIMIT ? OFFSET ?
-  `).bind(...params, limit, offset).all()
+  `).bind(...params, queryLimit, offset).all()
+
+  const rawRows = (rows.results ?? []) as Record<string, unknown>[]
+  const hasMore = skipTotal
+    ? rawRows.length > limit
+    : offset + limit < (total ?? 0)
+  const pageRows = skipTotal && rawRows.length > limit
+    ? rawRows.slice(0, limit)
+    : rawRows
+
+  const attachmentEmailIDs = pageRows
+    .filter((row) => Boolean(row.has_attachments) || Number(row.attachment_count ?? 0) > 0)
+    .map((row) => row.id as string)
+  const attachmentsByEmailID = new Map<string, Record<string, unknown>[]>()
+
+  if (attachmentEmailIDs.length > 0) {
+    const placeholders = attachmentEmailIDs.map(() => '?').join(', ')
+    const attachments = await env.DB.prepare(`
+      SELECT * FROM attachments
+      WHERE email_id IN (${placeholders})
+      ORDER BY email_id ASC, mime_part_index ASC
+    `).bind(...attachmentEmailIDs).all<Record<string, unknown>>()
+
+    for (const row of attachments.results ?? []) {
+      const emailID = row.email_id as string
+      const existing = attachmentsByEmailID.get(emailID)
+      if (existing) {
+        existing.push(row)
+      } else {
+        attachmentsByEmailID.set(emailID, [row])
+      }
+    }
+  }
 
   const emails = []
-  for (const row of rows.results) {
-    const r = row as Record<string, unknown>
-    const attachments = await env.DB.prepare(
-      'SELECT * FROM attachments WHERE email_id = ? ORDER BY mime_part_index ASC'
-    ).bind(r.id).all()
-
-    emails.push(toDetailEmail(r, attachments.results as Record<string, unknown>[]))
+  for (const row of pageRows) {
+    const emailID = row.id as string
+    emails.push(toDetailEmail(row, attachmentsByEmailID.get(emailID) ?? []))
   }
 
   return Response.json({
     emails,
-    total,
-    has_more: offset + limit < total,
+    total: total ?? (offset + pageRows.length + (hasMore ? 1 : 0)),
+    has_more: hasMore,
   })
 }
 
