@@ -13,11 +13,20 @@ type DirectExternalEmailThreadRow = {
   peer_email: string
   topic_key?: string
   topic_label?: string | null
+  stored_topic_label_raw?: boolean
   anchor_message_id: string
   references_chain: string
   reply_subject?: string | null
   created_at: string
   updated_at: string
+}
+
+const DIRECT_EXTERNAL_APP_TOPIC_LABEL_PREFIX = '[app-topic] '
+
+function encodeStoredDirectExternalTopicLabel(value: string | null | undefined): string | null | undefined {
+  if (value === undefined) return undefined
+  if (value === null) return null
+  return `${DIRECT_EXTERNAL_APP_TOPIC_LABEL_PREFIX}${value}`
 }
 
 function singleMailboxEnv(
@@ -240,6 +249,7 @@ interface RealtimeRoutingFixtures {
   groupsByMailbox?: Record<string, { id: string; mailbox: string; sync_mode?: 'mail' | 'fast_chat' }>
   groupMembersByGroupID?: Record<string, Array<{ user_id: string; member_mailbox: string; display_name?: string | null }>>
   externalMembersByGroupID?: Record<string, Array<{ email: string; display_name?: string | null }>>
+  directExternalEmailThreads?: DirectExternalEmailThreadRow[]
 }
 
 function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
@@ -254,6 +264,20 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
   )
   const groupMembersByGroupID = fixtures.groupMembersByGroupID ?? {}
   const externalMembersByGroupID = fixtures.externalMembersByGroupID ?? {}
+  const directExternalEmailThreads = [...(fixtures.directExternalEmailThreads ?? [])].map((row) => {
+    const { stored_topic_label_raw, ...rest } = row
+    return {
+      topic_key: 'default',
+      topic_label: null,
+      reply_subject: null,
+      ...rest,
+      topic_label: row.topic_label === undefined
+        ? null
+        : stored_topic_label_raw
+          ? row.topic_label
+          : encodeStoredDirectExternalTopicLabel(row.topic_label),
+    }
+  })
   const chatGroupMessageIndexRows: Array<Record<string, unknown>> = []
   const defaultResult = {
     run: async () => ({ success: true }),
@@ -357,6 +381,66 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
         }
       }
 
+      if (sql.includes('FROM direct_external_email_threads') && sql.includes('WHERE owner_mailbox = ? AND peer_email = ?')) {
+        return {
+          ...defaultResult,
+          all: async () => ({
+            results: directExternalEmailThreads
+              .filter((row) => normalize(row.owner_mailbox) === normalize(args[0]) && normalize(row.peer_email) === normalize(args[1]))
+              .sort((lhs, rhs) => {
+                const updatedOrder = String(rhs.updated_at).localeCompare(String(lhs.updated_at))
+                return updatedOrder !== 0 ? updatedOrder : String(rhs.id).localeCompare(String(lhs.id))
+              }),
+          }),
+          run: async () => ({ success: true }),
+        }
+      }
+
+      if (sql.includes('UPDATE direct_external_email_threads')) {
+        return {
+          ...defaultResult,
+          run: async () => {
+            if (sql.includes('SET reply_subject = ?, updated_at = ?')) {
+              const existing = directExternalEmailThreads.find((row) => row.id === String(args[2]))
+              if (existing) {
+                existing.reply_subject = args[0] === null ? null : String(args[0])
+                existing.updated_at = String(args[1])
+              }
+              return { success: true }
+            }
+            const existing = directExternalEmailThreads.find((row) => row.id === String(args[4]))
+            if (existing) {
+              existing.anchor_message_id = String(args[0])
+              existing.references_chain = String(args[1])
+              existing.reply_subject = args[2] === null ? null : String(args[2])
+              existing.updated_at = String(args[3])
+            }
+            return { success: true }
+          },
+        }
+      }
+
+      if (sql.includes('INSERT INTO direct_external_email_threads')) {
+        return {
+          ...defaultResult,
+          run: async () => {
+            directExternalEmailThreads.push({
+              id: String(args[0]),
+              owner_mailbox: String(args[1]),
+              peer_email: String(args[2]),
+              topic_key: String(args[3]),
+              topic_label: args[4] === null ? null : String(args[4]),
+              anchor_message_id: String(args[5]),
+              references_chain: String(args[6]),
+              reply_subject: args[7] === null ? null : String(args[7]),
+              created_at: String(args[8]),
+              updated_at: String(args[9]),
+            })
+            return { success: true }
+          },
+        }
+      }
+
       if (sql.includes('INSERT INTO chat_group_message_index')) {
         return {
           ...defaultResult,
@@ -393,6 +477,7 @@ function createRealtimeRoutingMockD1(fixtures: RealtimeRoutingFixtures = {}) {
     prepareMock,
     batchMock,
     chatGroupMessageIndexRows,
+    directExternalEmailThreads,
   }
 }
 
@@ -1583,6 +1668,51 @@ describe('worker: inbound email realtime notify', () => {
     expect(preparedSQL.some((sql: string) => sql.includes('FROM emails') && sql.includes('peer_address = ?'))).toBe(false)
   })
 
+  test('external direct inbound email does not expose the raw email subject as realtime topic', async () => {
+    const { db, directExternalEmailThreads } = createRealtimeRoutingMockD1({
+      directUsersByMailbox: {
+        'recipient@canyin.uk': 'user-recipient',
+      },
+    })
+    const env = {
+      DB: db,
+      MAILBOX: 'worker@canyin.uk',
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    } as Env
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify') {
+        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@gmail.com',
+      to: 'recipient@canyin.uk',
+      subject: 'Your XAI API account has been funded',
+      bodyText: 'External subject should not become app topic',
+      messageId: '<funded-subject@gmail.com>',
+    })
+    const harness = createExecutionContextHarness()
+    await worker.email(message, env, harness.ctx)
+    await harness.flush()
+
+    expect(directExternalEmailThreads).toHaveLength(1)
+    expect(directExternalEmailThreads[0]).toMatchObject({
+      owner_mailbox: 'recipient@canyin.uk',
+      peer_email: 'sender@gmail.com',
+      topic_key: 'your-xai-api-account-has-been-funded',
+      topic_label: null,
+      reply_subject: 'Your XAI API account has been funded',
+    })
+    expect(realtimeNotifyBodies).toHaveLength(1)
+    expect((realtimeNotifyBodies[0]!.data.message as Record<string, unknown>).topic).toBeUndefined()
+  })
+
   test('direct inbound html email includes cleaned text and render_text in realtime payload', async () => {
     const { db } = createRealtimeRoutingMockD1({
       directUsersByMailbox: {
@@ -1866,6 +1996,15 @@ describe('worker: inbound email realtime notify', () => {
 })
 
 function createDirectExternalThreadTrackingMockD1(directExternalEmailThreads: DirectExternalEmailThreadRow[]) {
+  for (const row of directExternalEmailThreads) {
+    if (!row.topic_key) row.topic_key = 'default'
+    if (row.topic_label === undefined) {
+      row.topic_label = null
+    } else if (!row.stored_topic_label_raw) {
+      row.topic_label = encodeStoredDirectExternalTopicLabel(row.topic_label)
+    }
+    if (row.reply_subject === undefined) row.reply_subject = null
+  }
   return {
     prepare: mock((sql: string) => ({
       bind: mock((...params: unknown[]) => {
@@ -2023,7 +2162,7 @@ describe('worker: inbound direct external thread tracking', () => {
       owner_mailbox: 'recipient@example.com',
       peer_email: 'sender@example.com',
       topic_key: 'a-different-note',
-      topic_label: 'A different note',
+      topic_label: null,
       anchor_message_id: '<external-new-compose@example.com>',
       references_chain: '<external-new-compose@example.com>',
       reply_subject: 'A different note',
@@ -2121,7 +2260,7 @@ describe('worker: inbound direct external thread tracking', () => {
     expect(directExternalEmailThreads[0]).toMatchObject({
       id: 'thread-topic-work-1',
       topic_key: 'work',
-      topic_label: 'work',
+      topic_label: encodeStoredDirectExternalTopicLabel('work'),
       anchor_message_id: '<work-reply@example.com>',
       references_chain: '<work-root@canyin.uk> <work-anchor@canyin.uk> <work-reply@example.com>',
       reply_subject: 'Re: Re: work',
@@ -2161,7 +2300,7 @@ describe('worker: inbound direct external thread tracking', () => {
     expect(directExternalEmailThreads[0]).toMatchObject({
       id: 'thread-topic-trip-1',
       topic_key: 'trip',
-      topic_label: 'Trip',
+      topic_label: encodeStoredDirectExternalTopicLabel('Trip'),
       anchor_message_id: '<trip-reply-status@example.com>',
       references_chain: '<trip-root@canyin.uk> <trip-anchor@canyin.uk> <trip-reply-status@example.com>',
       reply_subject: 'Re: Trip status',
