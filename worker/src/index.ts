@@ -287,9 +287,10 @@ export default {
       }))
       return
     }
-    const id = crypto.randomUUID()
     const now = new Date().toISOString()
-    const parsed = await parseIncomingEmail(await new Response(message.raw).arrayBuffer(), id, now)
+    const parsedEmailID = crypto.randomUUID()
+    const parsed = await parseIncomingEmail(await new Response(message.raw).arrayBuffer(), parsedEmailID, now)
+    const normalizedMessageID = normalizeMessageID(parsed.messageId)
     const subject = parsed.subject || message.headers.get('subject') || ''
     const code = extractEmailCode({
       subject,
@@ -297,69 +298,76 @@ export default {
       bodyHtml: parsed.bodyHtml,
     })
     const fromName = parseFromName(message.headers.get('from') ?? from)
-    const statements = [
-      env.DB.prepare(`
-        INSERT INTO emails (
-          id, mailbox, from_address, from_name, to_address, peer_address, subject,
-          body_text, body_html, code, headers, metadata, message_id,
-          has_attachments, attachment_count, attachment_names, attachment_search_text,
-          raw_storage_key, direction, status, received_at, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'inbound', 'received', ?, ?)
-      `).bind(
-        id,
-        mailbox,
-        fromAddress,
-        fromName,
-        mailbox,
-        fromAddress,
-        subject,
-        parsed.bodyText.slice(0, 50000),
-        parsed.bodyHtml.slice(0, 100000),
-        code,
-        JSON.stringify(parsed.headers),
-        JSON.stringify({}),
-        parsed.messageId,
-        parsed.attachmentCount > 0 ? 1 : 0,
-        parsed.attachmentCount,
-        parsed.attachmentNames,
-        parsed.attachmentSearchText,
-        null,
-        now,
-        now
-      ),
-      ...parsed.attachments.map((attachment) =>
-        env.DB.prepare(`
-          INSERT INTO attachments (
-            id, email_id, filename, content_type, size_bytes,
-            content_disposition, content_id, mime_part_index,
-            text_content, text_extraction_status, storage_key, created_at
-          )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).bind(
-          attachment.id,
-          attachment.email_id,
-          attachment.filename,
-          attachment.content_type,
-          attachment.size_bytes,
-          attachment.content_disposition,
-          attachment.content_id,
-          attachment.mime_part_index,
-          attachment.text_content,
-          attachment.text_extraction_status,
-          attachment.storage_key,
-          attachment.created_at
-        )
-      ),
-    ]
+    const existingInboundEmail = normalizedMessageID
+      ? await findExistingInboundEmailByMessageID(env, mailbox, normalizedMessageID)
+      : null
+    const id = existingInboundEmail?.id ?? parsedEmailID
 
-    await env.DB.batch(statements)
+    if (!existingInboundEmail) {
+      const statements = [
+        env.DB.prepare(`
+          INSERT INTO emails (
+            id, mailbox, from_address, from_name, to_address, peer_address, subject,
+            body_text, body_html, code, headers, metadata, message_id,
+            has_attachments, attachment_count, attachment_names, attachment_search_text,
+            raw_storage_key, direction, status, received_at, created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'inbound', 'received', ?, ?)
+        `).bind(
+          id,
+          mailbox,
+          fromAddress,
+          fromName,
+          mailbox,
+          fromAddress,
+          subject,
+          parsed.bodyText.slice(0, 50000),
+          parsed.bodyHtml.slice(0, 100000),
+          code,
+          JSON.stringify(parsed.headers),
+          JSON.stringify({}),
+          normalizedMessageID,
+          parsed.attachmentCount > 0 ? 1 : 0,
+          parsed.attachmentCount,
+          parsed.attachmentNames,
+          parsed.attachmentSearchText,
+          null,
+          now,
+          now
+        ),
+        ...parsed.attachments.map((attachment) =>
+          env.DB.prepare(`
+            INSERT INTO attachments (
+              id, email_id, filename, content_type, size_bytes,
+              content_disposition, content_id, mime_part_index,
+              text_content, text_extraction_status, storage_key, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            attachment.id,
+            attachment.email_id,
+            attachment.filename,
+            attachment.content_type,
+            attachment.size_bytes,
+            attachment.content_disposition,
+            attachment.content_id,
+            attachment.mime_part_index,
+            attachment.text_content,
+            attachment.text_extraction_status,
+            attachment.storage_key,
+            attachment.created_at
+          )
+        ),
+      ]
+
+      await env.DB.batch(statements)
+    }
     await maybeUpsertDirectExternalEmailThreadFromInbound(env, {
       mailbox,
       fromAddress,
       subject,
       headers: parsed.headers,
-      messageId: parsed.messageId,
+      messageId: normalizedMessageID,
       receivedAt: now,
     })
     const indexedGroupMessage = await maybeUpsertChatGroupMessageIndex(env, {
@@ -372,19 +380,21 @@ export default {
       provider: null,
       receivedAt: now,
     })
-    scheduleRealtimeNotifyForIncomingMailbox(env, ctx, {
-      mailbox,
-      senderMailbox: fromAddress,
-      senderName: fromName,
-      subject,
-      bodyText: parsed.bodyText,
-      bodyHtml: parsed.bodyHtml,
-      emailId: id,
-      messageId: parsed.messageId,
-      receivedAt: now,
-      currentGroupMessage: indexedGroupMessage,
-      source: 'email_inbound',
-    })
+    if (!existingInboundEmail) {
+      scheduleRealtimeNotifyForIncomingMailbox(env, ctx, {
+        mailbox,
+        senderMailbox: fromAddress,
+        senderName: fromName,
+        subject,
+        bodyText: parsed.bodyText,
+        bodyHtml: parsed.bodyHtml,
+        emailId: id,
+        messageId: normalizedMessageID,
+        receivedAt: now,
+        currentGroupMessage: indexedGroupMessage,
+        source: 'email_inbound',
+      })
+    }
   },
 } satisfies ExportedHandler<Env>
 
@@ -489,28 +499,27 @@ async function handleConversations(url: URL, env: Env, authorizedMailbox: string
 
   const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '20', 10) || 20, 100)
   const before = optionalIsoTime(url.searchParams.get('before'))
-  const params: Array<string | number> = [authorizedMailbox]
-  const beforeFilter = before ? ' AND e.received_at < ?' : ''
-
-  if (before) {
-    params.push(before)
-  }
-
+  const canonicalEmailsCte = buildCanonicalEmailsCte()
   const rows = await env.DB.prepare(`
-    WITH latest_per_peer AS (
+    ${canonicalEmailsCte},
+    filtered_emails AS (
+      SELECT *
+      FROM canonical_emails
+      WHERE peer_address IS NOT NULL
+        AND peer_address != ''
+        ${before ? 'AND received_at < ?' : ''}
+    ),
+    latest_per_peer AS (
       SELECT
         peer_address,
         MAX(received_at) AS last_at
-      FROM emails
-      WHERE mailbox = ?
-        AND peer_address IS NOT NULL
-        AND peer_address != ''
-        ${before ? 'AND received_at < ?' : ''}
+      FROM filtered_emails
       GROUP BY peer_address
     ), ranked AS (
       SELECT
         e.peer_address,
         e.id,
+        e.to_address,
         e.direction,
         e.status,
         e.body_text,
@@ -520,19 +529,17 @@ async function handleConversations(url: URL, env: Env, authorizedMailbox: string
           PARTITION BY e.peer_address
           ORDER BY e.received_at DESC, e.id DESC
         ) AS row_num
-      FROM emails e
+      FROM filtered_emails e
       INNER JOIN latest_per_peer latest
         ON latest.peer_address = e.peer_address
        AND latest.last_at = e.received_at
-      WHERE e.mailbox = ?
-        ${beforeFilter}
     )
     SELECT peer_address, id, to_address, direction, status, body_text, body_html, received_at
     FROM ranked
     WHERE row_num = 1
     ORDER BY received_at DESC, id DESC
     LIMIT ?
-  `).bind(...params, authorizedMailbox, ...(before ? [before] : []), limit).all<ConversationSummaryRow>()
+  `).bind(authorizedMailbox, ...(before ? [before] : []), limit).all<ConversationSummaryRow>()
 
   return Response.json({
     conversations: (rows.results ?? []).map((row) => ({
@@ -1276,6 +1283,50 @@ async function countRows(env: Env, sql: string, ...params: unknown[]): Promise<n
   return Number(row?.count ?? 0)
 }
 
+function canonicalEmailPartitionKey(tableAlias: string): string {
+  return `CASE
+    WHEN ${tableAlias}.message_id IS NOT NULL AND trim(${tableAlias}.message_id) != '' THEN ${tableAlias}.direction || ':mid:' || trim(${tableAlias}.message_id)
+    ELSE ${tableAlias}.direction || ':id:' || ${tableAlias}.id
+  END`
+}
+
+function buildCanonicalEmailsCte(tableAlias = 'e'): string {
+  return `
+    WITH canonical_emails AS (
+      SELECT * FROM (
+        SELECT
+          ${tableAlias}.*,
+          ROW_NUMBER() OVER (
+            PARTITION BY ${canonicalEmailPartitionKey(tableAlias)}
+            ORDER BY ${tableAlias}.received_at ASC, ${tableAlias}.id ASC
+          ) AS canonical_row_num
+        FROM emails ${tableAlias}
+        WHERE ${tableAlias}.mailbox = ?
+      )
+      WHERE canonical_row_num = 1
+    )
+  `
+}
+
+async function findExistingInboundEmailByMessageID(
+  env: Env,
+  mailbox: string,
+  messageID: string,
+): Promise<{ id: string } | null> {
+  return env.DB.prepare(`
+    SELECT id
+    FROM emails
+    WHERE mailbox = ?
+      AND direction = 'inbound'
+      AND message_id = ?
+    ORDER BY received_at ASC, id ASC
+    LIMIT 1
+  `).bind(
+    normalizeMailbox(mailbox),
+    messageID,
+  ).first<{ id: string }>()
+}
+
 async function runOptionalDelete(env: Env, sql: string, ...params: unknown[]): Promise<void> {
   try {
     await env.DB.prepare(sql).bind(...params).run()
@@ -1328,8 +1379,8 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   const direction = url.searchParams.get('direction')
   const skipTotal = url.searchParams.get('skip_total') === '1'
 
-  const whereParts = ['mailbox = ?']
-  const params: Array<string | number> = [authorizedMailbox]
+  const whereParts: string[] = []
+  const params: Array<string | number> = []
 
   if (sinceId) {
     whereParts.push('(received_at > ? OR (received_at = ? AND id > ?))')
@@ -1364,11 +1415,13 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   }
 
   const whereClause = whereParts.join(' AND ')
+  const canonicalEmailsCte = buildCanonicalEmailsCte()
   const total = skipTotal
     ? null
     : (await env.DB.prepare(
-      `SELECT COUNT(*) as total FROM emails WHERE ${whereClause}`
-    ).bind(...params).first<{ total: number }>())?.total ?? 0
+      `${canonicalEmailsCte}
+      SELECT COUNT(*) as total FROM canonical_emails WHERE ${whereClause}`
+    ).bind(authorizedMailbox, ...params).first<{ total: number }>())?.total ?? 0
 
   const orderBy = peer
     ? 'received_at DESC, id DESC'
@@ -1376,11 +1429,12 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   const queryLimit = skipTotal ? limit + 1 : limit
 
   const rows = await env.DB.prepare(`
-    SELECT * FROM emails
+    ${canonicalEmailsCte}
+    SELECT * FROM canonical_emails
     WHERE ${whereClause}
     ORDER BY ${orderBy}
     LIMIT ? OFFSET ?
-  `).bind(...params, queryLimit, offset).all()
+  `).bind(authorizedMailbox, ...params, queryLimit, offset).all()
 
   const rawRows = (rows.results ?? []) as Record<string, unknown>[]
   const hasMore = skipTotal
@@ -1441,6 +1495,7 @@ async function handleLatestInboundThread(url: URL, env: Env, authorizedMailbox: 
 
   const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '3'), 20)
   const rows = await env.DB.prepare(`
+    ${buildCanonicalEmailsCte()}
     SELECT
       id,
       mailbox,
@@ -1455,9 +1510,8 @@ async function handleLatestInboundThread(url: URL, env: Env, authorizedMailbox: 
       status,
       provider,
       received_at
-    FROM emails
-    WHERE mailbox = ?
-      AND direction = 'inbound'
+    FROM canonical_emails
+    WHERE direction = 'inbound'
       AND (
         peer_address = ?
         OR (peer_address IS NULL AND lower(trim(from_address)) = ?)

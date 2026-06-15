@@ -1591,6 +1591,57 @@ function makeForwardableEmailMessage(input: {
   } as unknown as ForwardableEmailMessage
 }
 
+function createInboundMessageDedupeMockD1(existingEmailIDByMessageID: Record<string, string> = {}) {
+  const prepareMock = mock((sql: string) => ({
+    bind: mock((...args: unknown[]) => {
+      if (sql.includes('FROM deleted_mailboxes')) {
+        return {
+          first: mock(() => Promise.resolve(null)),
+          all: mock(() => Promise.resolve({ results: [] })),
+          run: mock(() => Promise.resolve({ success: true })),
+        }
+      }
+
+      if (sql.includes('FROM chat_groups') && sql.includes("WHERE mailbox = ? AND status = 'active'")) {
+        return {
+          first: mock(() => Promise.resolve(null)),
+          all: mock(() => Promise.resolve({ results: [] })),
+          run: mock(() => Promise.resolve({ success: true })),
+        }
+      }
+
+      if (sql.includes("SELECT id") && sql.includes("direction = 'inbound'") && sql.includes('message_id = ?')) {
+        const messageID = String(args[1] ?? '')
+        const existingID = existingEmailIDByMessageID[messageID]
+        return {
+          first: mock(() => Promise.resolve(existingID ? { id: existingID } : null)),
+          all: mock(() => Promise.resolve({ results: [] })),
+          run: mock(() => Promise.resolve({ success: true })),
+        }
+      }
+
+      return {
+        first: mock(() => Promise.resolve(null)),
+        all: mock(() => Promise.resolve({ results: [] })),
+        run: mock(() => Promise.resolve({ success: true })),
+      }
+    }),
+  }))
+
+  const batchMock = mock(async (statements: Array<{ run: () => Promise<unknown> }>) => {
+    return Promise.all(statements.map((statement) => statement.run()))
+  })
+
+  return {
+    db: {
+      prepare: prepareMock,
+      batch: batchMock,
+    } as unknown as D1Database,
+    prepareMock,
+    batchMock,
+  }
+}
+
 describe('worker: inbound email realtime notify', () => {
   const originalFetch = globalThis.fetch
 
@@ -1995,6 +2046,32 @@ describe('worker: inbound email realtime notify', () => {
   })
 })
 
+describe('worker: inbound email dedupe', () => {
+  test('duplicate inbound message_id reuses the existing row instead of inserting again', async () => {
+    const { db, prepareMock, batchMock } = createInboundMessageDedupeMockD1({
+      '<duplicate@test.com>': 'email-existing-1',
+    })
+    const env = {
+      DB: db,
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Duplicate inbound',
+      bodyText: 'Hello again',
+      messageId: '<duplicate@test.com>',
+    })
+
+    await worker.email(message, env)
+
+    expect(batchMock).not.toHaveBeenCalled()
+    const preparedSql = (prepareMock as any).mock.calls.map(([sql]: [string]) => String(sql))
+    expect(preparedSql.some((sql: string) => sql.includes("direction = 'inbound'") && sql.includes('message_id = ?'))).toBe(true)
+    expect(preparedSql.some((sql: string) => sql.includes('INSERT INTO emails'))).toBe(false)
+  })
+})
+
 function createDirectExternalThreadTrackingMockD1(directExternalEmailThreads: DirectExternalEmailThreadRow[]) {
   for (const row of directExternalEmailThreads) {
     if (!row.topic_key) row.topic_key = 'default'
@@ -2393,7 +2470,7 @@ function createSyncMockD1(options: {
           return Promise.resolve({ total })
         }),
         all: mock(() => {
-          if (sql.includes('SELECT * FROM emails')) {
+          if (sql.includes('SELECT * FROM emails') || sql.includes('SELECT * FROM canonical_emails')) {
             return Promise.resolve({ results: defaultEmails })
           }
           if (sql.includes('FROM attachments') && sql.includes('email_id IN')) {
@@ -2800,7 +2877,7 @@ describe('worker: GET /api/sync', () => {
             return {
               first: mock(() => Promise.resolve({ total: 999 })),
               all: mock(() => {
-                if (sql.includes('SELECT * FROM emails')) {
+                if (sql.includes('SELECT * FROM emails') || sql.includes('SELECT * FROM canonical_emails')) {
                   return Promise.resolve({ results: [email1, email2] })
                 }
                 if (sql.includes('FROM attachments') && sql.includes('email_id IN')) {
@@ -2860,12 +2937,12 @@ describe('worker: GET /api/sync', () => {
 
     expect(response.status).toBe(200)
     expect(json.emails).toHaveLength(1)
-    const messageQuery = capturedSqls.find((sql) => sql.includes('SELECT * FROM emails'))
+    const messageQuery = capturedSqls.find((sql) => sql.includes('SELECT * FROM canonical_emails'))
     expect(messageQuery).toBeTruthy()
     expect(messageQuery!).toContain('peer_address = ?')
     expect(messageQuery!).toContain("peer_address IS NULL AND direction = 'inbound'")
     expect(messageQuery!).toContain("peer_address IS NULL AND direction = 'outbound'")
-    const messageBind = capturedBinds.find((entry) => entry.sql.includes('SELECT * FROM emails'))
+    const messageBind = capturedBinds.find((entry) => entry.sql.includes('SELECT * FROM canonical_emails'))
     expect(messageBind).toBeTruthy()
     expect(messageBind!.args.slice(2, 5)).toEqual(['friend@example.com', 'friend@example.com', 'friend@example.com'])
   })
@@ -2895,12 +2972,52 @@ describe('worker: GET /api/sync', () => {
     )
 
     expect(response.status).toBe(200)
-    const messageQuery = capturedSqls.find((sql) => sql.includes('SELECT * FROM emails'))
+    const messageQuery = capturedSqls.find((sql) => sql.includes('SELECT * FROM canonical_emails'))
     expect(messageQuery).toBeTruthy()
     expect(messageQuery!).toContain('direction = ?')
-    const messageBind = capturedBinds.find((entry) => entry.sql.includes('SELECT * FROM emails'))
+    const messageBind = capturedBinds.find((entry) => entry.sql.includes('SELECT * FROM canonical_emails'))
     expect(messageBind).toBeTruthy()
     expect(messageBind!.args).toContain('inbound')
+  })
+
+  test('sync does not replay a later duplicate row for the same message_id', async () => {
+    const duplicateRetry = makeSyncEmail({
+      id: 'dup-retry',
+      from_address: 'friend@example.com',
+      peer_address: 'friend@example.com',
+      message_id: '<dup@test.com>',
+      received_at: '2026-03-19T11:00:00Z',
+    })
+    const db = {
+      prepare: mock((sql: string) => ({
+        bind: mock(() => ({
+          first: mock(() => Promise.resolve(sql.includes('canonical_emails') ? { total: 0 } : { total: 1 })),
+          all: mock(() => {
+            if (sql.includes('SELECT * FROM canonical_emails')) {
+              return Promise.resolve({ results: [] })
+            }
+            if (sql.includes('SELECT * FROM emails')) {
+              return Promise.resolve({ results: [duplicateRetry] })
+            }
+            if (sql.includes('FROM attachments')) {
+              return Promise.resolve({ results: [] })
+            }
+            return Promise.resolve({ results: [] })
+          }),
+        })),
+      })),
+    } as unknown as D1Database
+
+    const env = singleMailboxEnv('user@test.com', { DB: db })
+    const response = await worker.fetch(
+      authedRequest('http://localhost/api/sync?to=user@test.com&since=2026-03-19T10:00:00Z&limit=20'),
+      env,
+    )
+    const json = await response.json() as { emails: any[]; total: number }
+
+    expect(response.status).toBe(200)
+    expect(json.emails).toHaveLength(0)
+    expect(json.total).toBe(0)
   })
 
   test('latest inbound thread returns lightweight inbound thread rows without count or attachment queries', async () => {
@@ -2971,6 +3088,179 @@ describe('worker: GET /api/sync', () => {
     expect(json.emails[0]?.body_text).toBeUndefined()
     expect(capturedSqls.some((sql) => sql.includes('COUNT(*)'))).toBe(false)
     expect(capturedSqls.some((sql) => sql.includes('FROM attachments'))).toBe(false)
+  })
+
+  test('internal conversations include to_address in the ranked query and response payload', async () => {
+    const capturedSqls: string[] = []
+    const db = {
+      prepare: mock((sql: string) => {
+        capturedSqls.push(sql)
+        return {
+          bind: mock(() => {
+            if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+              return {
+                first: mock(() => Promise.resolve({ id: 'user-1' })),
+                all: mock(() => Promise.resolve({ results: [] })),
+                run: mock(() => Promise.resolve({ success: true })),
+              }
+            }
+            return {
+              first: mock(() => Promise.resolve(null)),
+              all: mock(() => Promise.resolve({
+                results: [{
+                  peer_address: 'friend@example.com',
+                  id: 'conv-e1',
+                  to_address: 'user@test.com',
+                  direction: 'inbound',
+                  status: 'received',
+                  body_text: 'Hello world',
+                  body_html: '<p>Hello world</p>',
+                  received_at: '2026-03-19T10:00:00Z',
+                }],
+              })),
+              run: mock(() => Promise.resolve({ success: true })),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
+    } as Env
+    const accessToken = createAccessToken({ sub: 'user-1', email: 'user@test.com', mailbox: 'user@test.com' })
+    const response = await worker.fetch(
+      new Request('http://localhost/internal/conversations?to=user@test.com&limit=20', {
+        headers: {
+          Authorization: 'Bearer internal-token',
+          'X-Mailbox': 'user@test.com',
+          'X-User-Authorization': `Bearer ${accessToken}`,
+        },
+      }),
+      env,
+    )
+    const json = await response.json() as {
+      conversations: Array<{
+        peer: string
+        email: {
+          id: string
+          to_address: string
+          direction: string
+        }
+      }>
+    }
+
+    expect(response.status).toBe(200)
+    expect(json.conversations).toHaveLength(1)
+    expect(json.conversations[0]?.peer).toBe('friend@example.com')
+    expect(json.conversations[0]?.email.id).toBe('conv-e1')
+    expect(json.conversations[0]?.email.to_address).toBe('user@test.com')
+    const conversationQuery = capturedSqls.find((sql) => sql.includes('latest_per_peer AS'))
+    expect(conversationQuery).toBeTruthy()
+    expect(conversationQuery!).toContain('e.to_address')
+  })
+
+  test('internal conversations keep duplicate retries from reordering peers', async () => {
+    const db = {
+      prepare: mock((sql: string) => {
+        return {
+          bind: mock(() => {
+            if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+              return {
+                first: mock(() => Promise.resolve({ id: 'user-1' })),
+                all: mock(() => Promise.resolve({ results: [] })),
+                run: mock(() => Promise.resolve({ success: true })),
+              }
+            }
+            if (sql.includes('latest_per_peer AS')) {
+              return {
+                first: mock(() => Promise.resolve(null)),
+                all: mock(() => Promise.resolve({
+                  results: sql.includes('canonical_emails')
+                    ? [
+                      {
+                        peer_address: 'other@example.com',
+                        id: 'other-e1',
+                        to_address: 'user@test.com',
+                        direction: 'inbound',
+                        status: 'received',
+                        body_text: 'Latest real message',
+                        body_html: '<p>Latest real message</p>',
+                        received_at: '2026-03-19T10:30:00Z',
+                      },
+                      {
+                        peer_address: 'friend@example.com',
+                        id: 'friend-e1',
+                        to_address: 'user@test.com',
+                        direction: 'inbound',
+                        status: 'received',
+                        body_text: 'Older original',
+                        body_html: '<p>Older original</p>',
+                        received_at: '2026-03-19T09:00:00Z',
+                      },
+                    ]
+                    : [
+                      {
+                        peer_address: 'friend@example.com',
+                        id: 'friend-dup',
+                        to_address: 'user@test.com',
+                        direction: 'inbound',
+                        status: 'received',
+                        body_text: 'Duplicate retry',
+                        body_html: '<p>Duplicate retry</p>',
+                        received_at: '2026-03-19T11:00:00Z',
+                      },
+                      {
+                        peer_address: 'other@example.com',
+                        id: 'other-e1',
+                        to_address: 'user@test.com',
+                        direction: 'inbound',
+                        status: 'received',
+                        body_text: 'Latest real message',
+                        body_html: '<p>Latest real message</p>',
+                        received_at: '2026-03-19T10:30:00Z',
+                      },
+                    ],
+                })),
+                run: mock(() => Promise.resolve({ success: true })),
+              }
+            }
+            return {
+              first: mock(() => Promise.resolve(null)),
+              all: mock(() => Promise.resolve({ results: [] })),
+              run: mock(() => Promise.resolve({ success: true })),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
+    } as Env
+    const accessToken = createAccessToken({ sub: 'user-1', email: 'user@test.com', mailbox: 'user@test.com' })
+    const response = await worker.fetch(
+      new Request('http://localhost/internal/conversations?to=user@test.com&limit=20', {
+        headers: {
+          Authorization: 'Bearer internal-token',
+          'X-Mailbox': 'user@test.com',
+          'X-User-Authorization': `Bearer ${accessToken}`,
+        },
+      }),
+      env,
+    )
+    const json = await response.json() as {
+      conversations: Array<{ peer: string }>
+    }
+
+    expect(response.status).toBe(200)
+    expect(json.conversations).toHaveLength(2)
+    expect(json.conversations[0]?.peer).toBe('other@example.com')
+    expect(json.conversations[1]?.peer).toBe('friend@example.com')
   })
 
   test('latest inbound thread requires peer parameter', async () => {

@@ -158,6 +158,9 @@ CREATE INDEX IF NOT EXISTS idx_emails_mailbox ON emails(mailbox, received_at DES
 CREATE INDEX IF NOT EXISTS idx_emails_peer ON emails(mailbox, peer_address, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_emails_code ON emails(mailbox) WHERE code IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_emails_direction ON emails(direction);
+CREATE INDEX IF NOT EXISTS idx_emails_mailbox_direction_message_id
+  ON emails(mailbox, direction, message_id, received_at ASC, id ASC)
+  WHERE message_id IS NOT NULL AND message_id != '';
 CREATE INDEX IF NOT EXISTS idx_emails_has_attachments ON emails(mailbox, has_attachments, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_attachments_email_id ON attachments(email_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_filename ON attachments(filename);
