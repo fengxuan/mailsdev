@@ -9,6 +9,10 @@ binding = "DB"
 database_name = "mails-chat-prod"
 database_id = "1fdba7cb-8f19-4c95-a595-c4a47130d47b"
 
+[[services]]
+binding = "REALTIME_NOTIFY_SERVICE"
+service = "mails-realtime-notify"
+
 [vars]
 MAILBOX = "chat@canyin.uk"
 OUTBOUND_FROM_EMAIL = "chat@canyin.uk"

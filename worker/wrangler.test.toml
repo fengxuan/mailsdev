@@ -6,3 +6,7 @@ compatibility_date = "2024-12-01"
 binding = "DB"
 database_name = "mails-oss-test"
 database_id = "5cf523a6-f9a7-4b7a-b1d4-b1901c8e0d1a"
+
+[[services]]
+binding = "REALTIME_NOTIFY_SERVICE"
+service = "mails-realtime-notify"

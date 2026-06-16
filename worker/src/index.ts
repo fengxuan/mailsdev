@@ -1,6 +1,6 @@
 import { extractEmailCode } from './extract-code'
 import { buildMailChatProjection } from './mail-chat-projection'
-import { parseIncomingEmail } from './mime'
+import { decodeAttachmentContent, parseIncomingEmail, type PendingAttachmentTextExtraction } from './mime'
 import {
   AllProvidersFailedError,
   UnsupportedFeatureError,
@@ -39,6 +39,8 @@ export interface Env {
   EMAIL?: CloudflareEmailBinding
   /** Base URL for the realtime notify Worker, e.g. https://mails-realtime-notify.example.com */
   REALTIME_NOTIFY_BASE_URL?: string
+  /** Service binding for the realtime notify Worker. */
+  REALTIME_NOTIFY_SERVICE?: Fetcher
   /** Internal bearer token required by the realtime notify Worker. */
   REALTIME_INTERNAL_TOKEN?: string
   /**
@@ -80,6 +82,7 @@ type RealtimeNotifyScope = 'direct' | 'group'
 type RealtimeNotifyDirection = 'inbound' | 'outbound'
 type RealtimeConversationType = 'direct' | 'group'
 type RealtimeSyncMode = 'mail' | 'fast_chat'
+type RealtimeNotifyTransport = 'service_binding' | 'http_url'
 
 interface RealtimeConversationPayload {
   peer: string
@@ -289,7 +292,12 @@ export default {
     }
     const now = new Date().toISOString()
     const parsedEmailID = crypto.randomUUID()
-    const parsed = await parseIncomingEmail(await new Response(message.raw).arrayBuffer(), parsedEmailID, now)
+    const parsed = await parseIncomingEmail(
+      await new Response(message.raw).arrayBuffer(),
+      parsedEmailID,
+      now,
+      { deferAttachmentTextExtraction: true },
+    )
     const normalizedMessageID = normalizeMessageID(parsed.messageId)
     const subject = parsed.subject || message.headers.get('subject') || ''
     const code = extractEmailCode({
@@ -393,6 +401,12 @@ export default {
         receivedAt: now,
         currentGroupMessage: indexedGroupMessage,
         source: 'email_inbound',
+      })
+      scheduleDeferredAttachmentTextBackfill(env, ctx, {
+        emailId: id,
+        mailbox,
+        messageId: normalizedMessageID,
+        pendingAttachmentTextExtractions: parsed.pendingAttachmentTextExtractions,
       })
     }
   },
@@ -2132,7 +2146,27 @@ function normalizeMessageID(value: string | null | undefined): string | null {
 }
 
 function isRealtimeNotifyConfigured(env: Env): boolean {
-  return Boolean(env.REALTIME_NOTIFY_BASE_URL?.trim() && env.REALTIME_INTERNAL_TOKEN?.trim())
+  return hasRealtimeNotifyEndpoint(env) && Boolean(env.REALTIME_INTERNAL_TOKEN?.trim())
+}
+
+function hasRealtimeNotifyEndpoint(env: Env): boolean {
+  return Boolean(env.REALTIME_NOTIFY_SERVICE || env.REALTIME_NOTIFY_BASE_URL?.trim())
+}
+
+function requireRealtimeInternalToken(env: Env): string {
+  const token = env.REALTIME_INTERNAL_TOKEN?.trim()
+  if (!token) {
+    throw new Error('REALTIME_INTERNAL_TOKEN is not configured')
+  }
+  return token
+}
+
+function requireRealtimeNotifyBaseURL(env: Env): string {
+  const url = env.REALTIME_NOTIFY_BASE_URL?.trim()
+  if (!url) {
+    throw new Error('REALTIME_NOTIFY_BASE_URL is not configured')
+  }
+  return url
 }
 
 function scheduleRealtimeNotifyForIncomingMailboxes(
@@ -2268,6 +2302,7 @@ async function sendRealtimeNotifyEvent(env: Env, event: RealtimeNotifyEvent): Pr
       peer: event.peer,
       direction: event.direction,
       status: result.status,
+      notify_transport: result.transport,
     }))
     return
   }
@@ -2276,25 +2311,18 @@ async function sendRealtimeNotifyEvent(env: Env, event: RealtimeNotifyEvent): Pr
 async function sendRealtimeNotifyEvents(
   env: Env,
   events: RealtimeNotifyEvent[],
-): Promise<{ ok: boolean; status: number }> {
+): Promise<{ ok: boolean; status: number; transport: RealtimeNotifyTransport | null }> {
   if (events.length === 0) {
-    return { ok: true, status: 200 }
+    return { ok: true, status: 200, transport: null }
   }
 
   if (events.length === 1) {
     const event = events[0]!
     const envelope = buildRealtimeNotifyEnvelope(event)
-    const response = await fetch(new URL('/internal/notify', env.REALTIME_NOTIFY_BASE_URL), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${env.REALTIME_INTERNAL_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(envelope),
-    })
+    const { response, transport } = await sendRealtimeNotifyRequest(env, '/internal/notify', JSON.stringify(envelope))
 
     if (!response.ok) {
-      return { ok: false, status: response.status }
+      return { ok: false, status: response.status, transport }
     }
 
     console.log(JSON.stringify({
@@ -2308,22 +2336,20 @@ async function sendRealtimeNotifyEvents(
       scope: event.scope,
       peer: event.peer,
       direction: event.direction,
+      notify_transport: transport,
     }))
-    return { ok: true, status: response.status }
+    return { ok: true, status: response.status, transport }
   }
 
   const envelopes = events.map(buildRealtimeNotifyEnvelope)
-  const response = await fetch(new URL('/internal/notify-batch', env.REALTIME_NOTIFY_BASE_URL), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${env.REALTIME_INTERNAL_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ events: envelopes }),
-  })
+  const { response, transport } = await sendRealtimeNotifyRequest(
+    env,
+    '/internal/notify-batch',
+    JSON.stringify({ events: envelopes }),
+  )
 
   if (!response.ok) {
-    return { ok: false, status: response.status }
+    return { ok: false, status: response.status, transport }
   }
 
   console.log(JSON.stringify({
@@ -2334,8 +2360,40 @@ async function sendRealtimeNotifyEvents(
     mailbox: events[0]!.mailbox,
     scope: events[0]!.scope,
     peer: events[0]!.peer,
+    notify_transport: transport,
   }))
-  return { ok: true, status: response.status }
+  return { ok: true, status: response.status, transport }
+}
+
+async function sendRealtimeNotifyRequest(
+  env: Env,
+  path: '/internal/notify' | '/internal/notify-batch',
+  body: string,
+): Promise<{ response: Response; transport: RealtimeNotifyTransport }> {
+  const headers = {
+    Authorization: `Bearer ${requireRealtimeInternalToken(env)}`,
+    'Content-Type': 'application/json',
+  }
+
+  if (env.REALTIME_NOTIFY_SERVICE) {
+    return {
+      response: await env.REALTIME_NOTIFY_SERVICE.fetch(`https://mails-realtime-notify.internal${path}`, {
+        method: 'POST',
+        headers,
+        body,
+      }),
+      transport: 'service_binding',
+    }
+  }
+
+  return {
+    response: await fetch(new URL(path, requireRealtimeNotifyBaseURL(env)), {
+      method: 'POST',
+      headers,
+      body,
+    }),
+    transport: 'http_url',
+  }
 }
 
 function buildRealtimeNotifyEnvelope(event: RealtimeNotifyEvent) {
@@ -3084,6 +3142,104 @@ async function getActiveChatGroupExternalMemberForIndex(
     }))
     return null
   }
+}
+
+function scheduleDeferredAttachmentTextBackfill(
+  env: Env,
+  ctx: ExecutionContext | undefined,
+  input: {
+    emailId: string
+    mailbox: string
+    messageId?: string | null
+    pendingAttachmentTextExtractions: PendingAttachmentTextExtraction[]
+  },
+): void {
+  if (input.pendingAttachmentTextExtractions.length === 0) {
+    return
+  }
+
+  runBackground(ctx, (async () => {
+    try {
+      await backfillDeferredAttachmentTextExtractions(env, input)
+    } catch (error) {
+      console.warn(JSON.stringify({
+        event: 'attachment_text_backfill_failed',
+        source: 'mails-worker',
+        email_id: input.emailId,
+        mailbox: normalizeMailbox(input.mailbox),
+        message_id: input.messageId ?? null,
+        pending_attachment_count: input.pendingAttachmentTextExtractions.length,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+    }
+  })())
+}
+
+async function backfillDeferredAttachmentTextExtractions(
+  env: Env,
+  input: {
+    emailId: string
+    mailbox: string
+    messageId?: string | null
+    pendingAttachmentTextExtractions: PendingAttachmentTextExtraction[]
+  },
+): Promise<void> {
+  const statements: Array<ReturnType<D1Database['prepare']>> = []
+  let decodedCount = 0
+  let failedCount = 0
+
+  for (const pending of input.pendingAttachmentTextExtractions) {
+    let text = ''
+    let status: 'done' | 'failed' = 'done'
+
+    try {
+      text = decodeAttachmentContent(pending.content)
+      if (text.length > 0) {
+        decodedCount += 1
+      }
+    } catch {
+      status = 'failed'
+      failedCount += 1
+    }
+
+    statements.push(
+      env.DB.prepare(`
+        UPDATE attachments
+        SET text_content = ?, text_extraction_status = ?
+        WHERE id = ?
+      `).bind(text, status, pending.attachmentId),
+    )
+  }
+
+  statements.push(
+    env.DB.prepare(`
+      UPDATE emails
+      SET attachment_search_text = COALESCE((
+        SELECT group_concat(text_content, '\n\n')
+        FROM (
+          SELECT text_content
+          FROM attachments
+          WHERE email_id = ?
+            AND length(trim(text_content)) > 0
+          ORDER BY mime_part_index ASC
+        )
+      ), '')
+      WHERE id = ?
+    `).bind(input.emailId, input.emailId),
+  )
+
+  await env.DB.batch(statements)
+
+  console.log(JSON.stringify({
+    event: 'attachment_text_backfill_completed',
+    source: 'mails-worker',
+    email_id: input.emailId,
+    mailbox: normalizeMailbox(input.mailbox),
+    message_id: input.messageId ?? null,
+    pending_attachment_count: input.pendingAttachmentTextExtractions.length,
+    decoded_count: decodedCount,
+    failed_count: failedCount,
+  }))
 }
 
 async function findActiveDirectUserIdByMailbox(env: Env, mailbox: string): Promise<string | null> {

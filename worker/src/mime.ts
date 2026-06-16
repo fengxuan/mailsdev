@@ -20,18 +20,36 @@ export interface ParsedIncomingEmail {
   attachmentNames: string
   attachmentSearchText: string
   attachments: Attachment[]
+  pendingAttachmentTextExtractions: PendingAttachmentTextExtraction[]
+}
+
+export interface PendingAttachmentTextExtraction {
+  attachmentId: string
+  mimePartIndex: number
+  filename: string
+  content: PostalMimeAttachment['content']
+}
+
+interface ParseIncomingEmailOptions {
+  deferAttachmentTextExtraction?: boolean
 }
 
 export async function parseIncomingEmail(
   raw: ArrayBuffer,
   emailId: string,
-  createdAt: string
+  createdAt: string,
+  options: ParseIncomingEmailOptions = {},
 ): Promise<ParsedIncomingEmail> {
   const parser = new PostalMime({ attachmentEncoding: 'arraybuffer' })
   const parsed = await parser.parse(raw)
-  const attachments = parsed.attachments.map((attachment, index) =>
-    toAttachmentRecord(attachment, emailId, index, createdAt)
-  )
+  const pendingAttachmentTextExtractions: PendingAttachmentTextExtraction[] = []
+  const attachments = parsed.attachments.map((attachment, index) => {
+    const prepared = toAttachmentRecord(attachment, emailId, index, createdAt, options)
+    if (prepared.pendingTextExtraction) {
+      pendingAttachmentTextExtractions.push(prepared.pendingTextExtraction)
+    }
+    return prepared.attachment
+  })
   const rawBodyText = typeof parsed.text === 'string' ? parsed.text : ''
   const bodyHtml = typeof parsed.html === 'string' ? parsed.html : ''
   const bodyText = rawBodyText.trim().length > 0 ? rawBodyText : htmlToText(bodyHtml)
@@ -49,6 +67,7 @@ export async function parseIncomingEmail(
       .filter((value) => value.length > 0)
       .join('\n\n'),
     attachments,
+    pendingAttachmentTextExtractions,
   }
 }
 
@@ -56,26 +75,30 @@ function toAttachmentRecord(
   attachment: PostalMimeAttachment,
   emailId: string,
   mimePartIndex: number,
-  createdAt: string
-): Attachment {
+  createdAt: string,
+  options: ParseIncomingEmailOptions,
+): { attachment: Attachment; pendingTextExtraction: PendingAttachmentTextExtraction | null } {
   const filename = attachment.filename?.trim() || `attachment-${mimePartIndex + 1}`
   const sizeBytes = getAttachmentSize(attachment.content)
-  const { text, status } = extractAttachmentText(attachment, sizeBytes)
+  const extraction = prepareAttachmentTextExtraction(attachment, filename, sizeBytes, mimePartIndex, options)
 
   return {
-    id: crypto.randomUUID(),
-    email_id: emailId,
-    filename,
-    content_type: attachment.mimeType || 'application/octet-stream',
-    size_bytes: sizeBytes,
-    content_disposition: attachment.disposition ?? null,
-    content_id: attachment.contentId ?? null,
-    mime_part_index: mimePartIndex,
-    text_content: text,
-    text_extraction_status: status,
-    storage_key: null,
-    downloadable: false,
-    created_at: createdAt,
+    attachment: {
+      id: extraction.attachmentId,
+      email_id: emailId,
+      filename,
+      content_type: attachment.mimeType || 'application/octet-stream',
+      size_bytes: sizeBytes,
+      content_disposition: attachment.disposition ?? null,
+      content_id: attachment.contentId ?? null,
+      mime_part_index: mimePartIndex,
+      text_content: extraction.text,
+      text_extraction_status: extraction.status,
+      storage_key: null,
+      downloadable: false,
+      created_at: createdAt,
+    },
+    pendingTextExtraction: extraction.pendingTextExtraction,
   }
 }
 
@@ -94,29 +117,55 @@ function headersToRecord(headers: Array<{ originalKey: string; value: string }>)
   return record
 }
 
-function extractAttachmentText(
+function prepareAttachmentTextExtraction(
   attachment: PostalMimeAttachment,
-  sizeBytes: number | null
-): { text: string; status: AttachmentTextExtractionStatus } {
+  filename: string,
+  sizeBytes: number | null,
+  mimePartIndex: number,
+  options: ParseIncomingEmailOptions,
+): {
+  attachmentId: string
+  text: string
+  status: AttachmentTextExtractionStatus
+  pendingTextExtraction: PendingAttachmentTextExtraction | null
+} {
+  const attachmentId = crypto.randomUUID()
+
   if (sizeBytes !== null && sizeBytes > TEXT_EXTRACTION_LIMIT_BYTES) {
-    return { text: '', status: 'too_large' }
+    return { attachmentId, text: '', status: 'too_large', pendingTextExtraction: null }
   }
 
   if (!TEXT_ATTACHMENT_TYPES.has(attachment.mimeType)) {
-    return { text: '', status: 'unsupported' }
+    return { attachmentId, text: '', status: 'unsupported', pendingTextExtraction: null }
+  }
+
+  if (options.deferAttachmentTextExtraction) {
+    return {
+      attachmentId,
+      text: '',
+      status: 'pending',
+      pendingTextExtraction: {
+        attachmentId,
+        mimePartIndex,
+        filename,
+        content: attachment.content,
+      },
+    }
   }
 
   try {
     return {
+      attachmentId,
       text: decodeAttachmentContent(attachment.content),
       status: 'done',
+      pendingTextExtraction: null,
     }
   } catch {
-    return { text: '', status: 'failed' }
+    return { attachmentId, text: '', status: 'failed', pendingTextExtraction: null }
   }
 }
 
-function decodeAttachmentContent(content: PostalMimeAttachment['content']): string {
+export function decodeAttachmentContent(content: PostalMimeAttachment['content']): string {
   if (typeof content === 'string') {
     return content
   }
