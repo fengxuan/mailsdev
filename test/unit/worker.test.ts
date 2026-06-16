@@ -67,6 +67,10 @@ function createAccessToken(
   return `${encodedHeader}.${encodedPayload}.${signature}`
 }
 
+function decodeBase64UrlJSON(value: string): Record<string, unknown> {
+  return JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Record<string, unknown>
+}
+
 describe('worker: MIME parsing', () => {
   test('extracts body and text attachment metadata from multipart email', async () => {
     const attachment = Buffer.from('invoice number 42').toString('base64')
@@ -3355,10 +3359,12 @@ describe('worker: GET /api/sync', () => {
           direction: string
         }
       }>
+      next_cursor: string | null
     }
 
     expect(response.status).toBe(200)
     expect(json.conversations).toHaveLength(1)
+    expect(json.next_cursor).toBeNull()
     expect(json.conversations[0]?.peer).toBe('friend@example.com')
     expect(json.conversations[0]?.email.id).toBe('conv-e1')
     expect(json.conversations[0]?.email.to_address).toBe('user@test.com')
@@ -3367,7 +3373,7 @@ describe('worker: GET /api/sync', () => {
     expect(conversationQuery!).toContain('e.to_address')
     const conversationBind = capturedBinds.find((entry) => entry.sql.includes('latest_per_peer AS'))
     expect(conversationBind).toBeTruthy()
-    expect(conversationBind!.args.at(-1)).toBe(20)
+    expect(conversationBind!.args.at(-1)).toBe(21)
   })
 
   test('internal conversations keep duplicate retries from reordering peers', async () => {
@@ -3515,7 +3521,162 @@ describe('worker: GET /api/sync', () => {
     expect(response.status).toBe(200)
     const conversationBind = capturedBinds.find((entry) => entry.sql.includes('latest_per_peer AS'))
     expect(conversationBind).toBeTruthy()
-    expect(conversationBind!.args.at(-1)).toBe(1)
+    expect(conversationBind!.args.at(-1)).toBe(2)
+  })
+
+  test('internal conversations return a keyset next_cursor ordered by peer at equal timestamps', async () => {
+    const db = {
+      prepare: mock((sql: string) => {
+        return {
+          bind: mock(() => {
+            if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+              return {
+                first: mock(() => Promise.resolve({ id: 'user-1' })),
+                all: mock(() => Promise.resolve({ results: [] })),
+                run: mock(() => Promise.resolve({ success: true })),
+              }
+            }
+            return {
+              first: mock(() => Promise.resolve(null)),
+              all: mock(() => Promise.resolve({
+                results: [
+                  {
+                    peer_address: 'zeta@example.com',
+                    id: 'conv-zeta',
+                    to_address: 'user@test.com',
+                    direction: 'inbound',
+                    status: 'received',
+                    body_text: 'Newest equal timestamp peer',
+                    body_html: '<p>Newest equal timestamp peer</p>',
+                    received_at: '2026-03-19T10:30:00Z',
+                  },
+                  {
+                    peer_address: 'alpha@example.com',
+                    id: 'conv-alpha',
+                    to_address: 'user@test.com',
+                    direction: 'inbound',
+                    status: 'received',
+                    body_text: 'Second equal timestamp peer',
+                    body_html: '<p>Second equal timestamp peer</p>',
+                    received_at: '2026-03-19T10:30:00Z',
+                  },
+                  {
+                    peer_address: 'older@example.com',
+                    id: 'conv-older',
+                    to_address: 'user@test.com',
+                    direction: 'inbound',
+                    status: 'received',
+                    body_text: 'Older peer',
+                    body_html: '<p>Older peer</p>',
+                    received_at: '2026-03-19T09:00:00Z',
+                  },
+                ],
+              })),
+              run: mock(() => Promise.resolve({ success: true })),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
+    } as Env
+    const accessToken = createAccessToken({ sub: 'user-1', email: 'user@test.com', mailbox: 'user@test.com' })
+    const response = await worker.fetch(
+      new Request('http://localhost/internal/conversations?to=user@test.com&limit=2', {
+        headers: {
+          Authorization: 'Bearer internal-token',
+          'X-Mailbox': 'user@test.com',
+          'X-User-Authorization': `Bearer ${accessToken}`,
+        },
+      }),
+      env,
+    )
+    const json = await response.json() as {
+      conversations: Array<{ peer: string }>
+      next_cursor: string | null
+    }
+
+    expect(response.status).toBe(200)
+    expect(json.conversations.map((item) => item.peer)).toEqual([
+      'zeta@example.com',
+      'alpha@example.com',
+    ])
+    expect(json.next_cursor).toBeTruthy()
+    expect(decodeBase64UrlJSON(json.next_cursor!)).toEqual({
+      received_at: '2026-03-19T10:30:00Z',
+      peer: 'alpha@example.com',
+    })
+  })
+
+  test('internal conversations accept encoded before cursor for same-timestamp peer pagination', async () => {
+    const capturedBinds: Array<{ sql: string; args: unknown[] }> = []
+    const db = {
+      prepare: mock((sql: string) => {
+        return {
+          bind: mock((...args: unknown[]) => {
+            capturedBinds.push({ sql, args })
+            if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+              return {
+                first: mock(() => Promise.resolve({ id: 'user-1' })),
+                all: mock(() => Promise.resolve({ results: [] })),
+                run: mock(() => Promise.resolve({ success: true })),
+              }
+            }
+            return {
+              first: mock(() => Promise.resolve(null)),
+              all: mock(() => Promise.resolve({
+                results: [{
+                  peer_address: 'older@example.com',
+                  id: 'conv-older',
+                  to_address: 'user@test.com',
+                  direction: 'inbound',
+                  status: 'received',
+                  body_text: 'Older peer',
+                  body_html: '<p>Older peer</p>',
+                  received_at: '2026-03-19T09:00:00Z',
+                }],
+              })),
+              run: mock(() => Promise.resolve({ success: true })),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
+    } as Env
+    const accessToken = createAccessToken({ sub: 'user-1', email: 'user@test.com', mailbox: 'user@test.com' })
+    const before = Buffer.from(JSON.stringify({
+      received_at: '2026-03-19T10:30:00Z',
+      peer: 'alpha@example.com',
+    }), 'utf8').toString('base64url')
+    const response = await worker.fetch(
+      new Request(`http://localhost/internal/conversations?to=user@test.com&limit=2&before=${before}`, {
+        headers: {
+          Authorization: 'Bearer internal-token',
+          'X-Mailbox': 'user@test.com',
+          'X-User-Authorization': `Bearer ${accessToken}`,
+        },
+      }),
+      env,
+    )
+
+    expect(response.status).toBe(200)
+    const conversationBind = capturedBinds.find((entry) => entry.sql.includes('conversation_summaries AS'))
+    expect(conversationBind).toBeTruthy()
+    expect(conversationBind!.args.slice(-4)).toEqual([
+      '2026-03-19T10:30:00Z',
+      '2026-03-19T10:30:00Z',
+      'alpha@example.com',
+      3,
+    ])
   })
 
   test('latest inbound thread requires peer parameter', async () => {

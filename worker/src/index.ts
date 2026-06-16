@@ -78,6 +78,11 @@ interface ConversationSummaryRow {
   received_at: string
 }
 
+interface ConversationPageCursor {
+  receivedAt: string
+  peer?: string
+}
+
 type RealtimeNotifyScope = 'direct' | 'group'
 type RealtimeNotifyDirection = 'inbound' | 'outbound'
 type RealtimeConversationType = 'direct' | 'group'
@@ -544,7 +549,8 @@ async function handleConversations(url: URL, env: Env, authorizedMailbox: string
     min: 1,
     max: 100,
   })
-  const before = optionalIsoTime(url.searchParams.get('before'))
+  const before = optionalConversationCursor(url.searchParams.get('before'))
+  const pageSize = limit + 1
   const canonicalEmailsCte = buildCanonicalEmailsCte()
   const rows = await env.DB.prepare(`
     ${canonicalEmailsCte},
@@ -553,7 +559,6 @@ async function handleConversations(url: URL, env: Env, authorizedMailbox: string
       FROM canonical_emails
       WHERE peer_address IS NOT NULL
         AND peer_address != ''
-        ${before ? 'AND received_at < ?' : ''}
     ),
     latest_per_peer AS (
       SELECT
@@ -579,16 +584,34 @@ async function handleConversations(url: URL, env: Env, authorizedMailbox: string
       INNER JOIN latest_per_peer latest
         ON latest.peer_address = e.peer_address
        AND latest.last_at = e.received_at
+    ),
+    conversation_summaries AS (
+      SELECT peer_address, id, to_address, direction, status, body_text, body_html, received_at
+      FROM ranked
+      WHERE row_num = 1
     )
     SELECT peer_address, id, to_address, direction, status, body_text, body_html, received_at
-    FROM ranked
-    WHERE row_num = 1
-    ORDER BY received_at DESC, id DESC
+    FROM conversation_summaries
+    WHERE 1 = 1
+      ${before?.peer ? 'AND (received_at < ? OR (received_at = ? AND peer_address < ?))' : before ? 'AND received_at < ?' : ''}
+    ORDER BY received_at DESC, peer_address DESC
     LIMIT ?
-  `).bind(authorizedMailbox, ...(before ? [before] : []), limit).all<ConversationSummaryRow>()
+  `).bind(
+    authorizedMailbox,
+    ...(before?.peer
+      ? [before.receivedAt, before.receivedAt, before.peer]
+      : before
+        ? [before.receivedAt]
+        : []),
+    pageSize,
+  ).all<ConversationSummaryRow>()
+  const hasMore = (rows.results?.length ?? 0) > limit
+  const pageRows = hasMore
+    ? (rows.results ?? []).slice(0, limit)
+    : (rows.results ?? [])
 
   return Response.json({
-    conversations: (rows.results ?? []).map((row) => ({
+    conversations: pageRows.map((row) => ({
       peer: row.peer_address,
       email: {
         id: row.id,
@@ -600,7 +623,7 @@ async function handleConversations(url: URL, env: Env, authorizedMailbox: string
         received_at: row.received_at,
       },
     })),
-    next_cursor: null,
+    next_cursor: hasMore ? encodeConversationCursor(pageRows[pageRows.length - 1]) : null,
   })
 }
 
@@ -1806,6 +1829,18 @@ function optionalIsoTime(value: string | null): string | undefined {
   const trimmed = value?.trim()
   if (!trimmed) return undefined
   return trimmed
+}
+
+function optionalConversationCursor(value: string | null): ConversationPageCursor | undefined {
+  const trimmed = value?.trim()
+  if (!trimmed) return undefined
+
+  const decoded = decodeConversationCursor(trimmed)
+  if (decoded) {
+    return decoded
+  }
+
+  return { receivedAt: trimmed }
 }
 
 function optionalCursorId(value: string | null): string | undefined {
@@ -3437,6 +3472,48 @@ async function hmacSha256(secret: string, value: string): Promise<Uint8Array> {
   )
   const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(value))
   return new Uint8Array(signature)
+}
+
+function encodeConversationCursor(
+  row: Pick<ConversationSummaryRow, 'peer_address' | 'received_at'> | undefined,
+): string | null {
+  if (!row?.peer_address || !row.received_at) return null
+  return btoa(JSON.stringify({
+    received_at: row.received_at,
+    peer: row.peer_address,
+  }))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '')
+}
+
+function decodeConversationCursor(value: string): ConversationPageCursor | null {
+  try {
+    const parsed = JSON.parse(base64UrlDecode(value)) as { received_at?: unknown; peer?: unknown }
+    if (typeof parsed.received_at !== 'string') {
+      return null
+    }
+    const receivedAt = optionalIsoTime(parsed.received_at)
+    if (!receivedAt) {
+      return null
+    }
+    if (parsed.peer == null) {
+      return { receivedAt }
+    }
+    if (typeof parsed.peer !== 'string') {
+      return null
+    }
+    const peer = normalizeMailbox(parsed.peer)
+    if (!peer) {
+      return null
+    }
+    return {
+      receivedAt,
+      peer,
+    }
+  } catch {
+    return null
+  }
 }
 
 function base64UrlDecode(value: string): string {
