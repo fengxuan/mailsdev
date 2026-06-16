@@ -1,4 +1,4 @@
-import { extractEmailCode } from './extract-code'
+import { extractEmailCode, extractEmailCodeFromNormalizedSources } from './extract-code'
 import { buildMailChatProjection } from './mail-chat-projection'
 import { decodeAttachmentContent, parseIncomingEmail, type PendingAttachmentTextExtraction } from './mime'
 import {
@@ -300,10 +300,10 @@ export default {
     )
     const normalizedMessageID = normalizeMessageID(parsed.messageId)
     const subject = parsed.subject || message.headers.get('subject') || ''
-    const code = extractEmailCode({
+    const code = extractEmailCodeFromNormalizedSources({
       subject,
       bodyText: parsed.bodyText,
-      bodyHtml: parsed.bodyHtml,
+      bodyHtmlText: parsed.bodyHtmlText,
     })
     const fromName = parseFromName(message.headers.get('from') ?? from)
     const existingInboundEmail = normalizedMessageID
@@ -383,6 +383,7 @@ export default {
       mailbox,
       senderMailbox: fromAddress,
       senderName: fromName,
+      projection: parsed.chatProjection,
       bodyText: parsed.bodyText,
       bodyHtml: parsed.bodyHtml,
       provider: null,
@@ -396,6 +397,7 @@ export default {
         subject,
         bodyText: parsed.bodyText,
         bodyHtml: parsed.bodyHtml,
+        projection: parsed.chatProjection,
         emailId: id,
         messageId: normalizedMessageID,
         receivedAt: now,
@@ -1114,6 +1116,7 @@ async function maybeUpsertChatGroupMessageIndex(
     mailbox: string
     senderMailbox: string
     senderName: string
+    projection?: RealtimeMessageProjection
     bodyText?: string
     bodyHtml?: string
     provider: string | null
@@ -1124,7 +1127,7 @@ async function maybeUpsertChatGroupMessageIndex(
   if (!group) return null
 
   const normalizedSenderMailbox = normalizeMailbox(input.senderMailbox)
-  const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
+  const projection = input.projection ?? buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
   const member = await getActiveChatGroupMemberForIndex(env, group.id, normalizedSenderMailbox)
   if (member) {
     const senderEmail = member.member_mailbox
@@ -2178,6 +2181,7 @@ function scheduleRealtimeNotifyForIncomingMailboxes(
     senderName?: string | null
     bodyText?: string
     bodyHtml?: string
+    projection?: RealtimeMessageProjection
     emailId?: string
     receivedAt?: string
     currentGroupMessage?: IndexedGroupRealtimeMessageRef | null
@@ -2192,6 +2196,7 @@ function scheduleRealtimeNotifyForIncomingMailboxes(
       senderName: input.senderName,
       bodyText: input.bodyText,
       bodyHtml: input.bodyHtml,
+      projection: input.projection,
       emailId: input.emailId,
       receivedAt: input.receivedAt,
       currentGroupMessage: input.currentGroupMessage,
@@ -2210,6 +2215,7 @@ function scheduleRealtimeNotifyForIncomingMailbox(
     subject?: string | null
     bodyText?: string
     bodyHtml?: string
+    projection?: RealtimeMessageProjection
     emailId?: string
     messageId?: string | null
     receivedAt?: string
@@ -2230,6 +2236,7 @@ function scheduleRealtimeNotifyForIncomingMailbox(
         subject: input.subject,
         bodyText: input.bodyText,
         bodyHtml: input.bodyHtml,
+        projection: input.projection,
         emailId: input.emailId,
         messageId: input.messageId,
         receivedAt: input.receivedAt,
@@ -2446,6 +2453,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
     subject?: string | null
     bodyText?: string
     bodyHtml?: string
+    projection?: RealtimeMessageProjection
     emailId?: string
     messageId?: string | null
     receivedAt?: string
@@ -2493,6 +2501,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
             subject: input.subject,
             bodyText: input.bodyText,
             bodyHtml: input.bodyHtml,
+            projection: input.projection,
             receivedAt: input.currentGroupMessage.receivedAt,
           })
         : latestIndexedMessage
@@ -2511,6 +2520,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
               subject: input.subject,
               bodyText: input.bodyText,
               bodyHtml: input.bodyHtml,
+              projection: input.projection,
               receivedAt: input.receivedAt,
             })
           : {}),
@@ -2543,6 +2553,7 @@ async function resolveRealtimeEventsForIncomingMailbox(
         senderName: nonEmptyTrimmed(input.senderName) ?? null,
         bodyText: input.bodyText,
         bodyHtml: input.bodyHtml,
+        projection: input.projection,
         receivedAt: input.receivedAt,
       }),
     }]
@@ -2894,13 +2905,14 @@ function buildRealtimeGroupPayloadEventFieldsForInboundEmail(input: {
   subject?: string | null
   bodyText?: string
   bodyHtml?: string
+  projection?: RealtimeMessageProjection
   receivedAt: string
 }): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
   const direction: RealtimeNotifyDirection =
     normalizeMailbox(input.memberMailbox) === normalizeMailbox(input.senderMailbox)
       ? 'outbound'
       : 'inbound'
-  const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
+  const projection = input.projection ?? buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
   const senderMailbox = normalizeMailbox(input.senderMailbox)
   const topic = deriveVisibleGroupTopicLabel(input.subject, input.group.name)
   const groupTitle = preferredRealtimeGroupTitle(input.group)
@@ -2948,9 +2960,10 @@ function buildRealtimeDirectPayloadEventFieldsForInboundEmail(input: {
   senderName: string | null
   bodyText?: string
   bodyHtml?: string
+  projection?: RealtimeMessageProjection
   receivedAt: string
 }): Pick<RealtimeNotifyEvent, 'conversation' | 'message'> {
-  const projection = buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
+  const projection = input.projection ?? buildRealtimeMessageProjection(input.bodyText, input.bodyHtml)
   const topic = input.topic ?? null
 
   return {
@@ -3043,10 +3056,15 @@ const EMPTY_REALTIME_MESSAGE_PROJECTION = {
   renderText: null,
 }
 
+type RealtimeMessageProjection = {
+  text: string
+  renderText: string | null
+}
+
 function buildRealtimeMessageProjection(
   bodyText: string | null | undefined,
   bodyHtml: string | null | undefined,
-): { text: string; renderText: string | null } {
+): RealtimeMessageProjection {
   const normalizedBodyText = typeof bodyText === 'string' ? bodyText.slice(0, 50_000) : undefined
   const normalizedBodyHtml = typeof bodyHtml === 'string' ? bodyHtml.slice(0, 100_000) : undefined
   return buildMailChatProjection({

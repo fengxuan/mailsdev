@@ -38,8 +38,22 @@ export function extractEmailCode(input: {
   bodyHtml?: string | null
   storedCode?: string | null
 }): string | null {
+  return extractEmailCodeFromNormalizedSources({
+    subject: input.subject,
+    bodyText: input.bodyText,
+    bodyHtmlText: htmlToText(input.bodyHtml ?? ''),
+    storedCode: input.storedCode,
+  })
+}
+
+export function extractEmailCodeFromNormalizedSources(input: {
+  subject?: string | null
+  bodyText?: string | null
+  bodyHtmlText?: string | null
+  storedCode?: string | null
+}): string | null {
   const bodyText = normalizeText(input.bodyText ?? '')
-  const htmlText = normalizeText(htmlToText(input.bodyHtml ?? ''))
+  const htmlText = normalizeText(input.bodyHtmlText ?? '')
   const subject = normalizeText(input.subject ?? '')
   const storedCode = normalizeText(input.storedCode ?? '')
 
