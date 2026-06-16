@@ -1,4 +1,4 @@
-import { extractEmailCode, extractEmailCodeFromNormalizedSources } from './extract-code'
+import { extractEmailCode } from './extract-code'
 import { buildMailChatProjection } from './mail-chat-projection'
 import { decodeAttachmentContent, parseIncomingEmail, type PendingAttachmentTextExtraction } from './mime'
 import {
@@ -300,9 +300,10 @@ export default {
     )
     const normalizedMessageID = normalizeMessageID(parsed.messageId)
     const subject = parsed.subject || message.headers.get('subject') || ''
-    const code = extractEmailCodeFromNormalizedSources({
+    const code = extractEmailCode({
       subject,
       bodyText: parsed.bodyText,
+      bodyHtml: parsed.bodyHtml,
       bodyHtmlText: parsed.bodyHtmlText,
     })
     const fromName = parseFromName(message.headers.get('from') ?? from)
@@ -310,6 +311,10 @@ export default {
       ? await findExistingInboundEmailByMessageID(env, mailbox, normalizedMessageID)
       : null
     const id = existingInboundEmail?.id ?? parsedEmailID
+    const needsChatProjection = Boolean(group) || (!existingInboundEmail && isRealtimeNotifyConfigured(env))
+    const chatProjection = needsChatProjection
+      ? buildRealtimeMessageProjection(parsed.bodyText, parsed.bodyHtml)
+      : null
 
     if (!existingInboundEmail) {
       const statements = [
@@ -383,7 +388,7 @@ export default {
       mailbox,
       senderMailbox: fromAddress,
       senderName: fromName,
-      projection: parsed.chatProjection,
+      projection: chatProjection ?? undefined,
       bodyText: parsed.bodyText,
       bodyHtml: parsed.bodyHtml,
       provider: null,
@@ -397,7 +402,7 @@ export default {
         subject,
         bodyText: parsed.bodyText,
         bodyHtml: parsed.bodyHtml,
-        projection: parsed.chatProjection,
+        projection: chatProjection ?? undefined,
         emailId: id,
         messageId: normalizedMessageID,
         receivedAt: now,

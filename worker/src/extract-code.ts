@@ -36,14 +36,29 @@ export function extractEmailCode(input: {
   subject?: string | null
   bodyText?: string | null
   bodyHtml?: string | null
+  bodyHtmlText?: string | null
   storedCode?: string | null
 }): string | null {
-  return extractEmailCodeFromNormalizedSources({
-    subject: input.subject,
-    bodyText: input.bodyText,
-    bodyHtmlText: htmlToText(input.bodyHtml ?? ''),
-    storedCode: input.storedCode,
-  })
+  const bodyText = normalizeText(input.bodyText ?? '')
+  const bodyMatch = extractCode(bodyText)
+  if (bodyMatch) {
+    return bodyMatch
+  }
+
+  const htmlText = normalizeText(
+    input.bodyHtmlText ?? (input.bodyHtml ? htmlToText(input.bodyHtml) : ''),
+  )
+  if (htmlText && htmlText !== bodyText) {
+    const htmlMatch = extractCode(htmlText)
+    if (htmlMatch) {
+      return htmlMatch
+    }
+  }
+
+  const subject = normalizeText(input.subject ?? '')
+  const storedCode = normalizeText(input.storedCode ?? '')
+
+  return extractCode(subject) ?? extractCode(storedCode)
 }
 
 export function extractEmailCodeFromNormalizedSources(input: {

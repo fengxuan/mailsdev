@@ -1,7 +1,6 @@
 import PostalMime, { type Attachment as PostalMimeAttachment } from 'postal-mime'
 import type { Attachment, AttachmentTextExtractionStatus } from '../../src/core/types.js'
 import { htmlToText } from './extract-code'
-import { buildMailChatProjection, type MailChatProjection } from './mail-chat-projection'
 
 const TEXT_EXTRACTION_LIMIT_BYTES = 10 * 1024 * 1024
 const TEXT_ATTACHMENT_TYPES = new Set([
@@ -15,14 +14,13 @@ export interface ParsedIncomingEmail {
   subject: string
   bodyText: string
   bodyHtml: string
-  bodyHtmlText: string
+  bodyHtmlText: string | null
   headers: Record<string, string>
   messageId: string | null
   attachmentCount: number
   attachmentNames: string
   attachmentSearchText: string
   attachments: Attachment[]
-  chatProjection: MailChatProjection
   pendingAttachmentTextExtractions: PendingAttachmentTextExtraction[]
 }
 
@@ -54,13 +52,10 @@ export async function parseIncomingEmail(
     return prepared.attachment
   })
   const rawBodyText = typeof parsed.text === 'string' ? parsed.text : ''
+  const hasBodyText = rawBodyText.trim().length > 0
   const bodyHtml = typeof parsed.html === 'string' ? parsed.html : ''
-  const bodyHtmlText = htmlToText(bodyHtml)
-  const bodyText = rawBodyText.trim().length > 0 ? rawBodyText : bodyHtmlText
-  const chatProjection = buildMailChatProjection({
-    bodyText: bodyText.slice(0, 50_000),
-    bodyHTML: bodyHtml.slice(0, 100_000),
-  })
+  const bodyHtmlText = hasBodyText ? null : htmlToText(bodyHtml)
+  const bodyText = hasBodyText ? rawBodyText : (bodyHtmlText ?? '')
 
   return {
     subject: parsed.subject ?? '',
@@ -76,7 +71,6 @@ export async function parseIncomingEmail(
       .filter((value) => value.length > 0)
       .join('\n\n'),
     attachments,
-    chatProjection,
     pendingAttachmentTextExtractions,
   }
 }
