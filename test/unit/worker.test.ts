@@ -1610,7 +1610,7 @@ function createInboundMessageDedupeMockD1(existingEmailIDByMessageID: Record<str
         }
       }
 
-      if (sql.includes("SELECT id") && sql.includes("direction = 'inbound'") && sql.includes('message_id = ?')) {
+      if (sql.includes("SELECT id") && sql.includes("direction = 'inbound'") && sql.includes('lower(trim(message_id)) = ?')) {
         const messageID = String(args[1] ?? '')
         const existingID = existingEmailIDByMessageID[messageID]
         return {
@@ -2067,7 +2067,31 @@ describe('worker: inbound email dedupe', () => {
 
     expect(batchMock).not.toHaveBeenCalled()
     const preparedSql = (prepareMock as any).mock.calls.map(([sql]: [string]) => String(sql))
-    expect(preparedSql.some((sql: string) => sql.includes("direction = 'inbound'") && sql.includes('message_id = ?'))).toBe(true)
+    expect(preparedSql.some((sql: string) => sql.includes("direction = 'inbound'") && sql.includes('lower(trim(message_id)) = ?'))).toBe(true)
+    expect(preparedSql.some((sql: string) => sql.includes('INSERT INTO emails'))).toBe(false)
+  })
+
+  test('duplicate inbound message_id matches existing rows even when header casing differs', async () => {
+    const { db, prepareMock, batchMock } = createInboundMessageDedupeMockD1({
+      '<duplicate@test.com>': 'email-existing-1',
+    })
+    const env = {
+      DB: db,
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Duplicate inbound',
+      bodyText: 'Hello again',
+      messageId: '<Duplicate@Test.com>',
+    })
+
+    await worker.email(message, env)
+
+    expect(batchMock).not.toHaveBeenCalled()
+    const preparedSql = (prepareMock as any).mock.calls.map(([sql]: [string]) => String(sql))
+    expect(preparedSql.some((sql: string) => sql.includes("direction = 'inbound'") && sql.includes('lower(trim(message_id)) = ?'))).toBe(true)
     expect(preparedSql.some((sql: string) => sql.includes('INSERT INTO emails'))).toBe(false)
   })
 })

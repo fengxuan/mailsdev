@@ -161,6 +161,9 @@ CREATE INDEX IF NOT EXISTS idx_emails_direction ON emails(direction);
 CREATE INDEX IF NOT EXISTS idx_emails_mailbox_direction_message_id
   ON emails(mailbox, direction, message_id, received_at ASC, id ASC)
   WHERE message_id IS NOT NULL AND message_id != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_emails_unique_inbound_message_id
+  ON emails(mailbox, lower(trim(message_id)))
+  WHERE direction = 'inbound' AND message_id IS NOT NULL AND trim(message_id) != '';
 CREATE INDEX IF NOT EXISTS idx_emails_has_attachments ON emails(mailbox, has_attachments, received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_attachments_email_id ON attachments(email_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_filename ON attachments(filename);

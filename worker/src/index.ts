@@ -1294,7 +1294,7 @@ async function countRows(env: Env, sql: string, ...params: unknown[]): Promise<n
 
 function canonicalEmailPartitionKey(tableAlias: string): string {
   return `CASE
-    WHEN ${tableAlias}.message_id IS NOT NULL AND trim(${tableAlias}.message_id) != '' THEN ${tableAlias}.direction || ':mid:' || trim(${tableAlias}.message_id)
+    WHEN ${tableAlias}.message_id IS NOT NULL AND trim(${tableAlias}.message_id) != '' THEN ${tableAlias}.direction || ':mid:' || lower(trim(${tableAlias}.message_id))
     ELSE ${tableAlias}.direction || ':id:' || ${tableAlias}.id
   END`
 }
@@ -1328,7 +1328,7 @@ async function findExistingInboundEmailByMessageID(
     FROM emails
     WHERE mailbox = ?
       AND direction = 'inbound'
-      AND message_id = ?
+      AND lower(trim(message_id)) = ?
     ORDER BY received_at ASC, id ASC
     LIMIT 1
   `).bind(
@@ -2107,7 +2107,11 @@ function trimReferencesChainPreservingRoot(tokens: string[]): string[] {
 function parseMessageIDList(value: string | null | undefined): string[] {
   if (!value) return []
   const bracketedTokens = value.match(MESSAGE_ID_PATTERN) ?? []
-  if (bracketedTokens.length > 0) return bracketedTokens
+  if (bracketedTokens.length > 0) {
+    return bracketedTokens
+      .map((token) => normalizeMessageID(token))
+      .filter((token): token is string => Boolean(token))
+  }
 
   return (value.match(BARE_MESSAGE_ID_CANDIDATE_PATTERN) ?? [])
     .map((token) => normalizeMessageID(token))
@@ -2119,10 +2123,10 @@ function normalizeMessageID(value: string | null | undefined): string | null {
   if (!trimmed) return null
   const bracketedTokens = trimmed.match(MESSAGE_ID_PATTERN)
   if (bracketedTokens && bracketedTokens.length > 0) {
-    return bracketedTokens[0] ?? null
+    return bracketedTokens[0]?.toLowerCase() ?? null
   }
   if (BARE_MESSAGE_ID_PATTERN.test(trimmed)) {
-    return `<${trimmed}>`
+    return `<${trimmed.toLowerCase()}>`
   }
   return null
 }
