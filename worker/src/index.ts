@@ -428,7 +428,11 @@ async function handleGetCode(url: URL, env: Env, authorizedMailbox: string): Pro
     return Response.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const timeoutSec = Math.min(parseInt(url.searchParams.get('timeout') ?? '30'), 55)
+  const timeoutSec = parseBoundedInteger(url.searchParams.get('timeout'), {
+    defaultValue: 30,
+    min: 0,
+    max: 55,
+  })
   const since = url.searchParams.get('since')
   const deadline = Date.now() + timeoutSec * 1000
   const canonicalEmailsCte = buildCanonicalEmailsCte('e', "e.direction = 'inbound'")
@@ -485,8 +489,16 @@ async function handleInbox(url: URL, env: Env, authorizedMailbox: string): Promi
     return Response.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '20', 10) || 20, 100)
-  const offset = parseInt(url.searchParams.get('offset') ?? '0', 10) || 0
+  const limit = parseBoundedInteger(url.searchParams.get('limit'), {
+    defaultValue: 20,
+    min: 1,
+    max: 100,
+  })
+  const offset = parseBoundedInteger(url.searchParams.get('offset'), {
+    defaultValue: 0,
+    min: 0,
+    max: Number.MAX_SAFE_INTEGER,
+  })
   const direction = url.searchParams.get('direction')
   const query = url.searchParams.get('query')?.trim()
   const canonicalEmailsCte = buildCanonicalEmailsCte()
@@ -527,7 +539,11 @@ async function handleConversations(url: URL, env: Env, authorizedMailbox: string
     return Response.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '20', 10) || 20, 100)
+  const limit = parseBoundedInteger(url.searchParams.get('limit'), {
+    defaultValue: 20,
+    min: 1,
+    max: 100,
+  })
   const before = optionalIsoTime(url.searchParams.get('before'))
   const canonicalEmailsCte = buildCanonicalEmailsCte()
   const rows = await env.DB.prepare(`
@@ -1406,8 +1422,16 @@ async function handleSync(url: URL, env: Env, authorizedMailbox: string): Promis
   const before = optionalIsoTime(url.searchParams.get('before'))
   const sinceId = optionalCursorId(url.searchParams.get('since_id'))
   const beforeId = optionalCursorId(url.searchParams.get('before_id'))
-  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '100'), 500)
-  const offset = parseInt(url.searchParams.get('offset') ?? '0')
+  const limit = parseBoundedInteger(url.searchParams.get('limit'), {
+    defaultValue: 100,
+    min: 1,
+    max: 500,
+  })
+  const offset = parseBoundedInteger(url.searchParams.get('offset'), {
+    defaultValue: 0,
+    min: 0,
+    max: Number.MAX_SAFE_INTEGER,
+  })
   const direction = url.searchParams.get('direction')
   const skipTotal = url.searchParams.get('skip_total') === '1'
 
@@ -1525,7 +1549,11 @@ async function handleLatestInboundThread(url: URL, env: Env, authorizedMailbox: 
     return Response.json({ error: 'Missing ?peer= parameter' }, { status: 400 })
   }
 
-  const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '3'), 20)
+  const limit = parseBoundedInteger(url.searchParams.get('limit'), {
+    defaultValue: 3,
+    min: 1,
+    max: 20,
+  })
   const rows = await env.DB.prepare(`
     ${buildCanonicalEmailsCte()}
     SELECT
@@ -1751,6 +1779,21 @@ function resolveEmailCode(row: Record<string, unknown>): string | null {
 function parseFromName(from: string): string {
   const match = from.match(/^"?([^"<]+)"?\s*</)
   return match ? match[1]!.trim() : ''
+}
+
+function parseBoundedInteger(
+  value: string | null,
+  options: {
+    defaultValue: number
+    min: number
+    max: number
+  },
+): number {
+  const parsed = Number.parseInt(value ?? '', 10)
+  if (!Number.isFinite(parsed)) {
+    return options.defaultValue
+  }
+  return Math.min(options.max, Math.max(options.min, parsed))
 }
 
 function optionalPeer(value: string | null): string | undefined {

@@ -2543,6 +2543,30 @@ describe('worker: GET /api/inbox and /api/code', () => {
     expect(capturedArgs[1]).toBe('%100\\%\\_done%')
   })
 
+  test('clamps inbox pagination to sane bounds', async () => {
+    let capturedArgs: unknown[] = []
+    const db = {
+      prepare: mock(() => ({
+        bind: mock((...args: unknown[]) => {
+          capturedArgs = args
+          return {
+            all: mock(() => Promise.resolve({ results: [] })),
+          }
+        }),
+      })),
+    } as unknown as D1Database
+
+    const env = singleMailboxEnv('user@test.com', { DB: db })
+    const response = await worker.fetch(
+      authedRequest('http://localhost/api/inbox?to=user@test.com&limit=-5&offset=-99'),
+      env,
+    )
+
+    expect(response.status).toBe(200)
+    expect(capturedArgs.at(-2)).toBe(1)
+    expect(capturedArgs.at(-1)).toBe(0)
+  })
+
   test('recomputes inbox code from html-only body instead of stale stored code', async () => {
     const db = {
       prepare: mock(() => ({
@@ -2644,6 +2668,43 @@ describe('worker: GET /api/inbox and /api/code', () => {
     const json = await response.json() as { code: string | null }
 
     expect(response.status).toBe(200)
+    expect(json.code).toBe('114669')
+  })
+
+  test('falls back to the default code polling timeout when timeout is invalid', async () => {
+    let queryCount = 0
+    const db = {
+      prepare: mock(() => ({
+        bind: mock(() => ({
+          all: mock(() => {
+            queryCount += 1
+            return Promise.resolve({
+              results: [
+                {
+                  id: 'sync-e1',
+                  from_address: 'sender@test.com',
+                  subject: 'OTP Code',
+                  body_text: 'Your verification code is 114669',
+                  body_html: '',
+                  code: '114669',
+                  received_at: '2026-03-19T10:00:00Z',
+                },
+              ],
+            })
+          }),
+        })),
+      })),
+    } as unknown as D1Database
+
+    const env = singleMailboxEnv('user@test.com', { DB: db })
+    const response = await worker.fetch(
+      authedRequest('http://localhost/api/code?to=user@test.com&timeout=not-a-number'),
+      env,
+    )
+    const json = await response.json() as { code: string | null }
+
+    expect(response.status).toBe(200)
+    expect(queryCount).toBe(1)
     expect(json.code).toBe('114669')
   })
 
@@ -2977,6 +3038,33 @@ describe('worker: GET /api/sync', () => {
     expect(json.has_more).toBe(true)
   })
 
+  test('clamps sync pagination to sane bounds', async () => {
+    const capturedBinds: Array<{ sql: string; args: unknown[] }> = []
+    const db = {
+      prepare: mock((sql: string) => ({
+        bind: mock((...args: unknown[]) => {
+          capturedBinds.push({ sql, args })
+          return {
+            first: mock(() => Promise.resolve({ total: 0 })),
+            all: mock(() => Promise.resolve({ results: [] })),
+          }
+        }),
+      })),
+    } as unknown as D1Database
+
+    const env = singleMailboxEnv('user@test.com', { DB: db })
+    const response = await worker.fetch(
+      authedRequest('http://localhost/api/sync?to=user@test.com&limit=-5&offset=-8'),
+      env,
+    )
+
+    expect(response.status).toBe(200)
+    const messageBind = capturedBinds.find((entry) => entry.sql.includes('SELECT * FROM canonical_emails'))
+    expect(messageBind).toBeTruthy()
+    expect(messageBind!.args.at(-2)).toBe(1)
+    expect(messageBind!.args.at(-1)).toBe(0)
+  })
+
   test('skip_total avoids count queries and batches attachment reads', async () => {
     const email1 = makeSyncEmail({ id: 'sync-e1', has_attachments: 1, attachment_count: 1 })
     const email2 = makeSyncEmail({ id: 'sync-e2', subject: 'Second email', received_at: '2026-03-19T11:00:00Z' })
@@ -3207,11 +3295,13 @@ describe('worker: GET /api/sync', () => {
 
   test('internal conversations include to_address in the ranked query and response payload', async () => {
     const capturedSqls: string[] = []
+    const capturedBinds: Array<{ sql: string; args: unknown[] }> = []
     const db = {
       prepare: mock((sql: string) => {
         capturedSqls.push(sql)
         return {
-          bind: mock(() => {
+          bind: mock((...args: unknown[]) => {
+            capturedBinds.push({ sql, args })
             if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
               return {
                 first: mock(() => Promise.resolve({ id: 'user-1' })),
@@ -3275,6 +3365,9 @@ describe('worker: GET /api/sync', () => {
     const conversationQuery = capturedSqls.find((sql) => sql.includes('latest_per_peer AS'))
     expect(conversationQuery).toBeTruthy()
     expect(conversationQuery!).toContain('e.to_address')
+    const conversationBind = capturedBinds.find((entry) => entry.sql.includes('latest_per_peer AS'))
+    expect(conversationBind).toBeTruthy()
+    expect(conversationBind!.args.at(-1)).toBe(20)
   })
 
   test('internal conversations keep duplicate retries from reordering peers', async () => {
@@ -3378,6 +3471,53 @@ describe('worker: GET /api/sync', () => {
     expect(json.conversations[1]?.peer).toBe('friend@example.com')
   })
 
+  test('internal conversations clamp negative limits', async () => {
+    const capturedBinds: Array<{ sql: string; args: unknown[] }> = []
+    const db = {
+      prepare: mock((sql: string) => {
+        return {
+          bind: mock((...args: unknown[]) => {
+            capturedBinds.push({ sql, args })
+            if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+              return {
+                first: mock(() => Promise.resolve({ id: 'user-1' })),
+                all: mock(() => Promise.resolve({ results: [] })),
+                run: mock(() => Promise.resolve({ success: true })),
+              }
+            }
+            return {
+              first: mock(() => Promise.resolve(null)),
+              all: mock(() => Promise.resolve({ results: [] })),
+              run: mock(() => Promise.resolve({ success: true })),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
+    } as Env
+    const accessToken = createAccessToken({ sub: 'user-1', email: 'user@test.com', mailbox: 'user@test.com' })
+    const response = await worker.fetch(
+      new Request('http://localhost/internal/conversations?to=user@test.com&limit=-20', {
+        headers: {
+          Authorization: 'Bearer internal-token',
+          'X-Mailbox': 'user@test.com',
+          'X-User-Authorization': `Bearer ${accessToken}`,
+        },
+      }),
+      env,
+    )
+
+    expect(response.status).toBe(200)
+    const conversationBind = capturedBinds.find((entry) => entry.sql.includes('latest_per_peer AS'))
+    expect(conversationBind).toBeTruthy()
+    expect(conversationBind!.args.at(-1)).toBe(1)
+  })
+
   test('latest inbound thread requires peer parameter', async () => {
     const { db } = createSyncMockD1()
     const env = {
@@ -3401,6 +3541,53 @@ describe('worker: GET /api/sync', () => {
 
     expect(response.status).toBe(400)
     expect(json.error).toBe('Missing ?peer= parameter')
+  })
+
+  test('latest inbound thread clamps negative limits', async () => {
+    const capturedBinds: Array<{ sql: string; args: unknown[] }> = []
+    const db = {
+      prepare: mock((sql: string) => {
+        return {
+          bind: mock((...args: unknown[]) => {
+            capturedBinds.push({ sql, args })
+            if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+              return {
+                first: mock(() => Promise.resolve({ id: 'user-1' })),
+                all: mock(() => Promise.resolve({ results: [] })),
+                run: mock(() => Promise.resolve({ success: true })),
+              }
+            }
+            return {
+              first: mock(() => Promise.resolve(null)),
+              all: mock(() => Promise.resolve({ results: [] })),
+              run: mock(() => Promise.resolve({ success: true })),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
+    } as Env
+    const accessToken = createAccessToken({ sub: 'user-1', email: 'user@test.com', mailbox: 'user@test.com' })
+    const response = await worker.fetch(
+      new Request('http://localhost/internal/thread-latest-inbound?to=user@test.com&peer=friend@example.com&limit=-3', {
+        headers: {
+          Authorization: 'Bearer internal-token',
+          'X-Mailbox': 'user@test.com',
+          'X-User-Authorization': `Bearer ${accessToken}`,
+        },
+      }),
+      env,
+    )
+
+    expect(response.status).toBe(200)
+    const threadBind = capturedBinds.find((entry) => entry.sql.includes('FROM canonical_emails'))
+    expect(threadBind).toBeTruthy()
+    expect(threadBind!.args.at(-1)).toBe(1)
   })
 
   test('requires auth when AUTH_TOKEN set', async () => {
