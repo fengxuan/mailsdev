@@ -23,6 +23,8 @@ export interface Env {
   INTERNAL_API_TOKEN?: string
   /** Canonical local mailbox sender used for local-domain routing and generic outbound fallback. */
   OUTBOUND_FROM_EMAIL?: string
+  /** Optional comma-separated list of platform-managed mailbox domains, e.g. "canyin.uk,yepage.net". */
+  INTERNAL_MAILBOX_DOMAINS?: string
   /** Optional fixed sender address for Resend, e.g. chat@canyin.uk. */
   RESEND_FROM_EMAIL?: string
   /** Resend API key for outbound email sending. */
@@ -1003,8 +1005,8 @@ async function handleSend(
 
 async function classifyLocalRecipients(env: Env, recipients: string[]): Promise<LocalDeliveryClassification> {
   const normalizedRecipients = recipients.map(normalizeMailbox)
-  const localDomain = getLocalDomain(env)
-  if (!localDomain || normalizedRecipients.length === 0) {
+  const localDomains = getLocalDomains(env)
+  if (localDomains.length === 0 || normalizedRecipients.length === 0) {
     return {
       activeLocalRecipients: [],
       deletedLocalRecipients: [],
@@ -1014,7 +1016,7 @@ async function classifyLocalRecipients(env: Env, recipients: string[]): Promise<
     }
   }
 
-  const localDomainRecipients = normalizedRecipients.filter((recipient) => recipient.endsWith(`@${localDomain}`))
+  const localDomainRecipients = normalizedRecipients.filter((recipient) => isLocalMailbox(env, recipient))
   const hasExternalRecipients = localDomainRecipients.length !== normalizedRecipients.length
   if (localDomainRecipients.length === 0) {
     return {
@@ -1297,6 +1299,33 @@ function getLocalDomain(env: Env): string | null {
   const mailbox = env.OUTBOUND_FROM_EMAIL?.trim().toLowerCase() ?? env.MAILBOX?.trim().toLowerCase() ?? ''
   const domain = mailbox.split('@')[1] ?? ''
   return domain || null
+}
+
+function normalizeMailboxDomain(value: string | null | undefined): string | null {
+  const normalized = value?.trim().toLowerCase().replace(/^\.+|\.+$/g, '') ?? ''
+  return normalized || null
+}
+
+function mailboxDomain(value: string | null | undefined): string | null {
+  const normalized = value?.trim().toLowerCase() ?? ''
+  const atIndex = normalized.lastIndexOf('@')
+  if (atIndex < 0 || atIndex === normalized.length - 1) {
+    return null
+  }
+  return normalizeMailboxDomain(normalized.slice(atIndex + 1))
+}
+
+function getLocalDomains(env: Env): string[] {
+  const primaryDomain = getLocalDomain(env)
+  const configuredDomains = env.INTERNAL_MAILBOX_DOMAINS?.split(',')
+    .map((value) => normalizeMailboxDomain(value))
+    .filter((value): value is string => Boolean(value)) ?? []
+  return [...new Set([primaryDomain, ...configuredDomains].filter((value): value is string => Boolean(value)))]
+}
+
+function isLocalMailbox(env: Env, value: string | null | undefined): boolean {
+  const domain = mailboxDomain(value)
+  return domain ? getLocalDomains(env).includes(domain) : false
 }
 
 async function handleDeleteMailbox(env: Env, mailbox: string): Promise<Response> {
@@ -1653,11 +1682,10 @@ async function maybeUpsertDirectExternalEmailThreadFromInbound(
     return
   }
 
-  const localDomain = getLocalDomain(env)
-  if (!localDomain) {
+  if (getLocalDomains(env).length === 0) {
     return
   }
-  if (peerEmail.endsWith(`@${localDomain}`)) {
+  if (isLocalMailbox(env, peerEmail)) {
     return
   }
 
@@ -1903,9 +1931,7 @@ function stripReplySubjectPrefix(subject: string | null | undefined): string | n
 const DIRECT_EXTERNAL_APP_TOPIC_LABEL_PREFIX = '[app-topic] '
 
 function isExternalDirectPeer(env: Env, peer: string): boolean {
-  const localDomain = getLocalDomain(env)
-  if (!localDomain) return false
-  return !normalizeMailbox(peer).endsWith(`@${localDomain}`)
+  return !isLocalMailbox(env, normalizeMailbox(peer))
 }
 
 function deriveExternalDirectTopicLabel(env: Env, peer: string, subject: string | null | undefined): string | null {

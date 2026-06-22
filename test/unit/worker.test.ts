@@ -2561,6 +2561,27 @@ describe('worker: inbound direct external thread tracking', () => {
 
     expect(directExternalEmailThreads).toHaveLength(0)
   })
+
+  test('inbound secondary local-domain sender does not update direct_external_email_threads', async () => {
+    const directExternalEmailThreads: DirectExternalEmailThreadRow[] = []
+    const env = {
+      DB: createDirectExternalThreadTrackingMockD1(directExternalEmailThreads),
+      MAILBOX: 'worker@canyin.uk',
+      INTERNAL_MAILBOX_DOMAINS: 'canyin.uk,yepage.net',
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'peer@yepage.net',
+      to: 'recipient@example.com',
+      subject: 'Internal mail from yepage',
+      bodyText: 'This should still be treated as local mail',
+      messageId: '<internal-mail-yepage@yepage.net>',
+    })
+
+    await worker.email(message, env)
+
+    expect(directExternalEmailThreads).toHaveLength(0)
+  })
 })
 
 // --- GET /api/sync tests ---

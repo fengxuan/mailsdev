@@ -16,6 +16,7 @@ service = "mails-realtime-notify"
 [vars]
 MAILBOX = "chat@canyin.uk"
 OUTBOUND_FROM_EMAIL = "chat@canyin.uk"
+INTERNAL_MAILBOX_DOMAINS = "canyin.uk,yepage.net"
 RESEND_FROM_EMAIL = "chat@canyin.uk"
 ZEPTOMAIL_FROM_EMAIL = "chat@yepage.net"
 ZEPTOMAIL_API_BASE_URL = "https://api.zeptomail.eu"
