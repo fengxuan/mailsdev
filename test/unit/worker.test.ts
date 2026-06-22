@@ -659,6 +659,7 @@ describe('worker: POST /api/send', () => {
     const env = singleMailboxEnv('me@example.com', {
       DB: db,
       ZEPTOMAIL_API_KEY: 'zt_test_key',
+      ZEPTOMAIL_API_BASE_URL: 'https://api.zeptomail.eu',
       EMAIL_PROVIDERS: 'zeptomail',
     })
 
@@ -682,7 +683,7 @@ describe('worker: POST /api/send', () => {
 
     expect(globalThis.fetch).toHaveBeenCalledTimes(1)
     const [zeptoUrl, zeptoInit] = (globalThis.fetch as any).mock.calls[0]
-    expect(zeptoUrl).toBe('https://api.zeptomail.com/v1.1/email')
+    expect(zeptoUrl).toBe('https://api.zeptomail.eu/v1.1/email')
     expect(zeptoInit.method).toBe('POST')
     expect(zeptoInit.headers['Authorization']).toBe('Zoho-enczapikey zt_test_key')
     const zeptoBody = JSON.parse(zeptoInit.body)
@@ -708,7 +709,7 @@ describe('worker: POST /api/send', () => {
 
     globalThis.fetch = mock((input: RequestInfo | URL) => {
       const url = String(input)
-      if (url === 'https://api.zeptomail.com/v1.1/email') {
+      if (url === 'https://api.zeptomail.eu/v1.1/email') {
         return Promise.resolve(Response.json({ request_id: 'zepto-default-123' }, { status: 200 }))
       }
       return Promise.resolve(Response.json({ id: 'resend-should-not-run' }, { status: 200 }))
@@ -727,7 +728,7 @@ describe('worker: POST /api/send', () => {
     expect(json.id).toBe('zepto-default-123')
     expect(json.provider).toBe('zeptomail')
     expect(globalThis.fetch).toHaveBeenCalledTimes(1)
-    expect(String((globalThis.fetch as any).mock.calls[0][0])).toBe('https://api.zeptomail.com/v1.1/email')
+    expect(String((globalThis.fetch as any).mock.calls[0][0])).toBe('https://api.zeptomail.eu/v1.1/email')
   })
 
   test('uses provider-specific sender domains across ZeptoMail and Resend fallback', async () => {
@@ -742,7 +743,7 @@ describe('worker: POST /api/send', () => {
 
     globalThis.fetch = mock((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url === 'https://api.zeptomail.com/v1.1/email') {
+      if (url === 'https://api.zeptomail.eu/v1.1/email') {
         return Promise.resolve(Response.json({
           error: {
             message: 'sender rejected',

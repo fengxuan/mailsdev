@@ -24,7 +24,9 @@ interface ZeptoMailAddress {
   name?: string
 }
 
-export function createZeptoMailProvider(apiKey: string): SendProvider {
+const DEFAULT_ZEPTOMAIL_API_BASE_URL = 'https://api.zeptomail.eu'
+
+export function createZeptoMailProvider(apiKey: string, apiBaseUrl?: string): SendProvider {
   return {
     name: 'zeptomail',
 
@@ -75,7 +77,7 @@ export function createZeptoMailProvider(apiKey: string): SendProvider {
         }
       }
 
-      const res = await fetch('https://api.zeptomail.com/v1.1/email', {
+      const res = await fetch(resolveZeptoMailEndpoint(apiBaseUrl), {
         method: 'POST',
         headers: {
           'Accept': 'application/json',
@@ -116,4 +118,9 @@ function parseAddress(value: string): ZeptoMailAddress {
 
 function stripWrappingQuotes(value: string): string {
   return value.replace(/^"(.*)"$/, '$1').trim()
+}
+
+function resolveZeptoMailEndpoint(apiBaseUrl?: string): string {
+  const baseUrl = apiBaseUrl?.trim() || DEFAULT_ZEPTOMAIL_API_BASE_URL
+  return new URL('/v1.1/email', baseUrl).toString()
 }

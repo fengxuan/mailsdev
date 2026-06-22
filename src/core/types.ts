@@ -88,6 +88,7 @@ export interface MailsConfig {
   storage_provider: string
   resend_api_key?: string
   zeptomail_api_key?: string
+  zeptomail_api_base_url?: string
   db9_token?: string
   db9_database_id?: string
   cloudflare_api_token?: string

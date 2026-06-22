@@ -158,7 +158,7 @@ describe('ZeptoMailProvider', () => {
     const fetchMock = mock(() =>
       Promise.resolve(Response.json({ request_id: 'zepto-99' }, { status: 200 })),
     )
-    const z = new ZeptoMailProvider('zk', fetchMock as unknown as typeof fetch)
+    const z = new ZeptoMailProvider('zk', fetchMock as unknown as typeof fetch, 'https://api.zeptomail.eu')
     const res = await z.send(baseReq({
       html: '<p>h</p>',
       reply_to: 'reply@example.com',
@@ -171,7 +171,7 @@ describe('ZeptoMailProvider', () => {
     expect(res).toEqual({ id: 'zepto-99', provider: 'zeptomail' })
 
     const [url, init] = (fetchMock as any).mock.calls[0]
-    expect(url).toBe('https://api.zeptomail.com/v1.1/email')
+    expect(url).toBe('https://api.zeptomail.eu/v1.1/email')
     expect((init as RequestInit).method).toBe('POST')
     const body = JSON.parse((init as RequestInit).body as string)
     expect(body.from).toEqual({ address: 'me@example.com' })

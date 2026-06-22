@@ -28,14 +28,14 @@ function resolveProvider(): SendProvider {
 
   const preferredSendProvider = config.send_provider?.trim().toLowerCase()
   if (preferredSendProvider === 'zeptomail' && config.zeptomail_api_key) {
-    return createZeptoMailProvider(config.zeptomail_api_key)
+    return createZeptoMailProvider(config.zeptomail_api_key, config.zeptomail_api_base_url)
   }
   if (preferredSendProvider === 'resend' && config.resend_api_key) {
     return createResendProvider(config.resend_api_key)
   }
 
   if (config.zeptomail_api_key) {
-    return createZeptoMailProvider(config.zeptomail_api_key)
+    return createZeptoMailProvider(config.zeptomail_api_key, config.zeptomail_api_base_url)
   }
   if (config.resend_api_key) {
     return createResendProvider(config.resend_api_key)

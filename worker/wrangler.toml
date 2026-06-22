@@ -18,6 +18,7 @@ MAILBOX = "chat@canyin.uk"
 OUTBOUND_FROM_EMAIL = "chat@canyin.uk"
 RESEND_FROM_EMAIL = "chat@canyin.uk"
 ZEPTOMAIL_FROM_EMAIL = "chat@yepage.net"
+ZEPTOMAIL_API_BASE_URL = "https://api.zeptomail.eu"
 REALTIME_NOTIFY_BASE_URL = "https://mails-realtime-internal.canyin.uk"
 
 # ---- Outbound email providers ----

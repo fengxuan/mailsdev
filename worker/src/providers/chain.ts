@@ -18,6 +18,7 @@ export interface ChainEnv {
   EMAIL?: CloudflareEmailBinding
   RESEND_API_KEY?: string
   ZEPTOMAIL_API_KEY?: string
+  ZEPTOMAIL_API_BASE_URL?: string
   AWS_SES_REGION?: string
   AWS_ACCESS_KEY_ID?: string
   AWS_SECRET_ACCESS_KEY?: string
@@ -41,7 +42,7 @@ export function buildProviderChain(env: ChainEnv, fetchImpl: typeof fetch = fetc
       ))
     } else if (name === 'zeptomail' && env.ZEPTOMAIL_API_KEY) {
       chain.push(withFixedFrom(
-        new ZeptoMailProvider(env.ZEPTOMAIL_API_KEY, fetchImpl),
+        new ZeptoMailProvider(env.ZEPTOMAIL_API_KEY, fetchImpl, env.ZEPTOMAIL_API_BASE_URL),
         env.ZEPTOMAIL_FROM_EMAIL ?? env.OUTBOUND_FROM_EMAIL,
       ))
     } else if (

@@ -10,7 +10,7 @@ describe('ZeptoMail provider', () => {
 
   test('sends email successfully', async () => {
     globalThis.fetch = mock(async (url: string, init: RequestInit) => {
-      expect(url).toBe('https://api.zeptomail.com/v1.1/email')
+      expect(url).toBe('https://api.zeptomail.eu/v1.1/email')
       expect(init.method).toBe('POST')
       expect(init.headers).toEqual({
         Accept: 'application/json',
@@ -32,7 +32,7 @@ describe('ZeptoMail provider', () => {
       return new Response(JSON.stringify({ request_id: 'zepto_req_123' }), { status: 200 })
     }) as typeof fetch
 
-    const provider = createZeptoMailProvider('zt_test_key')
+    const provider = createZeptoMailProvider('zt_test_key', 'https://api.zeptomail.eu')
     const result = await provider.send({
       from: 'Agent <agent@test.com>',
       to: ['user@example.com'],

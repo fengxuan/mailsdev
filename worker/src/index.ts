@@ -31,6 +31,8 @@ export interface Env {
   ZEPTOMAIL_FROM_EMAIL?: string
   /** ZeptoMail API key for outbound email sending. */
   ZEPTOMAIL_API_KEY?: string
+  /** Optional ZeptoMail API base URL, e.g. https://api.zeptomail.eu. */
+  ZEPTOMAIL_API_BASE_URL?: string
   /** AWS SES region for outbound email sending, e.g. us-east-1. */
   AWS_SES_REGION?: string
   /** AWS access key id for SES API requests. */

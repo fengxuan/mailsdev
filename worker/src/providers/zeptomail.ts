@@ -24,6 +24,8 @@ interface ZeptoMailErrorResponse {
   request_id?: string
 }
 
+const DEFAULT_ZEPTOMAIL_API_BASE_URL = 'https://api.zeptomail.eu'
+
 export class ZeptoMailProvider implements EmailProvider {
   readonly name = 'zeptomail' as const
   private readonly fetchImpl: typeof fetch
@@ -31,6 +33,7 @@ export class ZeptoMailProvider implements EmailProvider {
   constructor(
     private apiKey: string,
     fetchImpl?: typeof fetch,
+    private apiBaseUrl: string = DEFAULT_ZEPTOMAIL_API_BASE_URL,
   ) {
     this.fetchImpl = fetchImpl ?? ((input, init) => fetch(input, init))
   }
@@ -78,7 +81,7 @@ export class ZeptoMailProvider implements EmailProvider {
     }
 
     const doFetch = this.fetchImpl
-    const res = await doFetch('https://api.zeptomail.com/v1.1/email', {
+    const res = await doFetch(resolveZeptoMailEndpoint(this.apiBaseUrl), {
       method: 'POST',
       headers: {
         Accept: 'application/json',
@@ -118,4 +121,9 @@ function parseAddress(value: string): ZeptoMailAddress {
 
 function stripWrappingQuotes(value: string): string {
   return value.replace(/^"(.*)"$/, '$1').trim()
+}
+
+function resolveZeptoMailEndpoint(apiBaseUrl: string): string {
+  const baseUrl = apiBaseUrl.trim() || DEFAULT_ZEPTOMAIL_API_BASE_URL
+  return new URL('/v1.1/email', baseUrl).toString()
 }
