@@ -1,6 +1,7 @@
 import { describe, expect, test, mock } from 'bun:test'
 import { CloudflareProvider } from '../../worker/src/providers/cloudflare'
 import { ResendProvider } from '../../worker/src/providers/resend'
+import { ZeptoMailProvider } from '../../worker/src/providers/zeptomail'
 import { SESProvider } from '../../worker/src/providers/ses'
 import {
   buildProviderChain,
@@ -145,6 +146,85 @@ describe('ResendProvider', () => {
   })
 })
 
+describe('ZeptoMailProvider', () => {
+  test('supports all requests', () => {
+    const z = new ZeptoMailProvider('k')
+    expect(z.supports(baseReq())).toBe(true)
+    expect(z.supports(baseReq({ attachments: [{ filename: 'f', content: 'x' }] }))).toBe(true)
+    expect(z.supports(baseReq({ cc: ['c@d.com'], bcc: ['e@f.com'] }))).toBe(true)
+  })
+
+  test('posts to ZeptoMail API with mapped body', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(Response.json({ request_id: 'zepto-99' }, { status: 200 })),
+    )
+    const z = new ZeptoMailProvider('zk', fetchMock as unknown as typeof fetch)
+    const res = await z.send(baseReq({
+      html: '<p>h</p>',
+      reply_to: 'reply@example.com',
+      cc: ['cc@example.com'],
+      bcc: ['bcc@example.com'],
+      headers: { 'In-Reply-To': '<msg@test.com>' },
+      attachments: [{ filename: 'f.pdf', content: 'AAAA', content_type: 'application/pdf' }],
+    }))
+
+    expect(res).toEqual({ id: 'zepto-99', provider: 'zeptomail' })
+
+    const [url, init] = (fetchMock as any).mock.calls[0]
+    expect(url).toBe('https://api.zeptomail.com/v1.1/email')
+    expect((init as RequestInit).method).toBe('POST')
+    const body = JSON.parse((init as RequestInit).body as string)
+    expect(body.from).toEqual({ address: 'me@example.com' })
+    expect(body.to).toEqual([{ email_address: { address: 'you@example.com' } }])
+    expect(body.htmlbody).toBe('<p>h</p>')
+    expect(body.textbody).toBeUndefined()
+    expect(body.reply_to).toEqual([{ address: 'reply@example.com' }])
+    expect(body.cc).toEqual([{ email_address: { address: 'cc@example.com' } }])
+    expect(body.bcc).toEqual([{ email_address: { address: 'bcc@example.com' } }])
+    expect(body.mime_headers).toEqual({ 'In-Reply-To': '<msg@test.com>' })
+    expect(body.attachments).toEqual([{
+      name: 'f.pdf',
+      content: 'AAAA',
+      mime_type: 'application/pdf',
+    }])
+  })
+
+  test('rewrites ZeptoMail from/reply_to when provider-specific sender is configured', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(Response.json({ request_id: 'zepto-fixed-from' }, { status: 200 })),
+    )
+    const [provider] = buildProviderChain({
+      ZEPTOMAIL_API_KEY: 'zk',
+      ZEPTOMAIL_FROM_EMAIL: 'chat@yepage.net',
+      EMAIL_PROVIDERS: 'zeptomail',
+    }, fetchMock as unknown as typeof fetch)
+
+    const res = await sendWithChain([provider!], baseReq({
+      from: 'Agent <me@canyin.uk>',
+    }))
+
+    expect(res).toEqual({ id: 'zepto-fixed-from', provider: 'zeptomail' })
+
+    const [, init] = (fetchMock as any).mock.calls[0]
+    const body = JSON.parse((init as RequestInit).body as string)
+    expect(body.from).toEqual({ address: 'chat@yepage.net', name: 'Agent' })
+    expect(body.reply_to).toEqual([{ address: 'me@canyin.uk' }])
+  })
+
+  test('throws on non-2xx response', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(Response.json({
+        error: {
+          message: 'sender not verified',
+          details: [{ target: 'from.address', message: 'domain mismatch' }],
+        },
+      }, { status: 403 })),
+    )
+    const z = new ZeptoMailProvider('zk', fetchMock as unknown as typeof fetch)
+    await expect(z.send(baseReq())).rejects.toThrow('ZeptoMail: sender not verified (from.address: domain mismatch)')
+  })
+})
+
 describe('SESProvider', () => {
   test('supports standard text/html requests but not attachments', () => {
     const ses = new SESProvider({ accessKeyId: 'akid', secretAccessKey: 'secret' }, { region: 'us-east-1' })
@@ -205,15 +285,16 @@ describe('SESProvider', () => {
 })
 
 describe('buildProviderChain', () => {
-  test('defaults to cloudflare,resend,ses order with configured providers only', () => {
+  test('defaults to cloudflare,zeptomail,resend,ses order with configured providers only', () => {
     const chain = buildProviderChain({
       EMAIL: { send: async () => ({ id: 'x' }) },
       RESEND_API_KEY: 'k',
+      ZEPTOMAIL_API_KEY: 'z',
       AWS_SES_REGION: 'us-east-1',
       AWS_ACCESS_KEY_ID: 'akid',
       AWS_SECRET_ACCESS_KEY: 'secret',
     })
-    expect(chain.map(p => p.name)).toEqual(['cloudflare', 'resend', 'ses'])
+    expect(chain.map(p => p.name)).toEqual(['cloudflare', 'zeptomail', 'resend', 'ses'])
   })
 
   test('includes ses when configured explicitly', () => {
@@ -239,6 +320,11 @@ describe('buildProviderChain', () => {
   test('skips cloudflare when no binding', () => {
     const chain = buildProviderChain({ RESEND_API_KEY: 'k' })
     expect(chain.map(p => p.name)).toEqual(['resend'])
+  })
+
+  test('includes zeptomail when it is the only configured provider', () => {
+    const chain = buildProviderChain({ ZEPTOMAIL_API_KEY: 'z' })
+    expect(chain.map(p => p.name)).toEqual(['zeptomail'])
   })
 
   test('skips resend when no api key but still uses later configured defaults', () => {
@@ -269,36 +355,39 @@ describe('buildProviderChain', () => {
     const chain = buildProviderChain({
       EMAIL: { send: async () => ({}) },
       RESEND_API_KEY: 'k',
+      ZEPTOMAIL_API_KEY: 'z',
       AWS_SES_REGION: 'us-east-1',
       AWS_ACCESS_KEY_ID: 'akid',
       AWS_SECRET_ACCESS_KEY: 'secret',
-      EMAIL_PROVIDERS: 'ses,resend,cloudflare',
+      EMAIL_PROVIDERS: 'ses,zeptomail,resend,cloudflare',
     })
-    expect(chain.map(p => p.name)).toEqual(['ses', 'resend', 'cloudflare'])
+    expect(chain.map(p => p.name)).toEqual(['ses', 'zeptomail', 'resend', 'cloudflare'])
   })
 
   test('EMAIL_PROVIDERS dedupes and ignores unknown', () => {
     const chain = buildProviderChain({
       EMAIL: { send: async () => ({}) },
       RESEND_API_KEY: 'k',
+      ZEPTOMAIL_API_KEY: 'z',
       AWS_SES_REGION: 'us-east-1',
       AWS_ACCESS_KEY_ID: 'akid',
       AWS_SECRET_ACCESS_KEY: 'secret',
-      EMAIL_PROVIDERS: 'ses,resend,resend, bogus, cloudflare, ses',
+      EMAIL_PROVIDERS: 'ses,zeptomail,resend,zeptomail, bogus, cloudflare, ses',
     })
-    expect(chain.map(p => p.name)).toEqual(['ses', 'resend', 'cloudflare'])
+    expect(chain.map(p => p.name)).toEqual(['ses', 'zeptomail', 'resend', 'cloudflare'])
   })
 
   test('EMAIL_PROVIDERS empty string falls back to default', () => {
     const chain = buildProviderChain({
       EMAIL: { send: async () => ({}) },
       RESEND_API_KEY: 'k',
+      ZEPTOMAIL_API_KEY: 'z',
       AWS_SES_REGION: 'us-east-1',
       AWS_ACCESS_KEY_ID: 'akid',
       AWS_SECRET_ACCESS_KEY: 'secret',
       EMAIL_PROVIDERS: '',
     })
-    expect(chain.map(p => p.name)).toEqual(['cloudflare', 'resend', 'ses'])
+    expect(chain.map(p => p.name)).toEqual(['cloudflare', 'zeptomail', 'resend', 'ses'])
   })
 })
 
@@ -331,12 +420,24 @@ describe('sendWithChain', () => {
   })
 
   test('falls back when primary throws', async () => {
+    const originalWarn = console.warn
+    const warnMock = mock(() => {})
+    console.warn = warnMock as typeof console.warn
+
     const cf = makeProvider('cloudflare', {
       send: () => Promise.reject(new Error('binding exploded')),
     })
     const rs = makeProvider('resend')
-    const res = await sendWithChain([cf, rs], baseReq())
-    expect(res.provider).toBe('resend')
+    try {
+      const res = await sendWithChain([cf, rs], baseReq())
+      expect(res.provider).toBe('resend')
+      expect(warnMock).toHaveBeenCalledTimes(1)
+      expect(String((warnMock as any).mock.calls[0][0])).toContain('"event":"outbound_provider_failed"')
+      expect(String((warnMock as any).mock.calls[0][0])).toContain('"provider":"cloudflare"')
+      expect(String((warnMock as any).mock.calls[0][0])).toContain('binding exploded')
+    } finally {
+      console.warn = originalWarn
+    }
   })
 
   test('throws UnsupportedFeatureError when no provider supports request', async () => {

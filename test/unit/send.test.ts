@@ -7,7 +7,7 @@ const BASE_CONFIG: MailsConfig = {
   mode: 'hosted',
   domain: 'mails.dev',
   mailbox: '',
-  send_provider: 'resend',
+  send_provider: 'zeptomail',
   storage_provider: 'sqlite',
   resend_api_key: 're_test',
   default_from: 'Bot <bot@test.com>',
@@ -59,11 +59,62 @@ describe('send', () => {
   })
 
   test('throws when no resend_api_key', async () => {
-    saveConfig({ ...BASE_CONFIG, resend_api_key: undefined })
+    saveConfig({ ...BASE_CONFIG, resend_api_key: undefined, send_provider: 'resend' })
 
     expect(
       send({ to: 'a@b.com', subject: 'Test', text: 'hi' })
     ).rejects.toThrow('resend_api_key not configured')
+  })
+
+  test('uses zeptomail when only zeptomail_api_key is configured', async () => {
+    saveConfig({
+      ...BASE_CONFIG,
+      resend_api_key: undefined,
+      zeptomail_api_key: 'zt_test_key',
+    })
+
+    let sentBody: Record<string, unknown> = {}
+    let sentHeaders: Record<string, string> = {}
+    globalThis.fetch = mock(async (_url: string, init: RequestInit) => {
+      sentHeaders = init.headers as Record<string, string>
+      sentBody = JSON.parse(init.body as string)
+      return new Response(JSON.stringify({ request_id: 'zepto_1' }))
+    }) as typeof fetch
+
+    const result = await send({
+      to: 'user@example.com',
+      subject: 'Hello',
+      text: 'World',
+    })
+
+    expect(sentHeaders['Authorization']).toBe('Zoho-enczapikey zt_test_key')
+    expect(sentBody.from).toEqual({
+      address: 'bot@test.com',
+      name: 'Bot',
+    })
+    expect(sentBody.to).toEqual([
+      { email_address: { address: 'user@example.com' } },
+    ])
+    expect(sentBody.textbody).toBe('World')
+    expect(result).toEqual({ id: 'zepto_1', provider: 'zeptomail' })
+  })
+
+  test('prefers zeptomail by default when both provider keys are configured', async () => {
+    saveConfig({
+      ...BASE_CONFIG,
+      resend_api_key: 're_should_not_use',
+      zeptomail_api_key: 'zt_default_priority',
+    })
+
+    let authHeader = ''
+    globalThis.fetch = mock(async (_url: string, init: RequestInit) => {
+      authHeader = (init.headers as Record<string, string>)['Authorization']
+      return new Response(JSON.stringify({ request_id: 'zepto_default' }))
+    }) as typeof fetch
+
+    const result = await send({ to: 'user@example.com', subject: 'Default priority', text: 'test' })
+    expect(authHeader).toBe('Zoho-enczapikey zt_default_priority')
+    expect(result.provider).toBe('zeptomail')
   })
 
   test('throws when no from address', async () => {
@@ -147,6 +198,39 @@ describe('send', () => {
     expect(
       send({ to: 'a@b.com', subject: 'Test', text: 'hi' })
     ).rejects.toThrow('resend_api_key not configured')
+  })
+
+  test('prefers zeptomail when send_provider=zeptomail', async () => {
+    saveConfig({
+      ...BASE_CONFIG,
+      resend_api_key: 're_should_not_use',
+      zeptomail_api_key: 'zt_preferred',
+      send_provider: 'zeptomail',
+    })
+
+    let authHeader = ''
+    globalThis.fetch = mock(async (_url: string, init: RequestInit) => {
+      authHeader = (init.headers as Record<string, string>)['Authorization']
+      return new Response(JSON.stringify({ request_id: 'zepto_preferred' }))
+    }) as typeof fetch
+
+    const result = await send({ to: 'user@example.com', subject: 'Preferred', text: 'test' })
+    expect(authHeader).toBe('Zoho-enczapikey zt_preferred')
+    expect(result.provider).toBe('zeptomail')
+  })
+
+  test('throws zeptomail_api_key error when explicitly set as provider without key', async () => {
+    saveConfig({
+      ...BASE_CONFIG,
+      resend_api_key: undefined,
+      zeptomail_api_key: undefined,
+      api_key: undefined,
+      send_provider: 'zeptomail',
+    })
+
+    expect(
+      send({ to: 'a@b.com', subject: 'Test', text: 'hi' })
+    ).rejects.toThrow('zeptomail_api_key not configured')
   })
 
   test('uses OSS provider when worker_url is configured', async () => {

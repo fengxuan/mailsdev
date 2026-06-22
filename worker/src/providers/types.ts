@@ -17,7 +17,7 @@ export interface SendRequest {
   attachments?: SendAttachment[]
 }
 
-export type ProviderName = 'cloudflare' | 'resend' | 'ses'
+export type ProviderName = 'cloudflare' | 'resend' | 'zeptomail' | 'ses'
 
 export interface SendResult {
   id: string

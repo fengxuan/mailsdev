@@ -3,6 +3,7 @@ export { getInbox, searchInbox, getEmail, waitForCode, downloadAttachment } from
 export { getStorage } from './core/storage.js'
 export { loadConfig, saveConfig, getConfigValue, setConfigValue } from './core/config.js'
 export { createResendProvider } from './providers/send/resend.js'
+export { createZeptoMailProvider } from './providers/send/zeptomail.js'
 export { createHostedSendProvider } from './providers/send/hosted.js'
 export { createOSSSendProvider } from './providers/send/oss.js'
 export { createSqliteProvider } from './providers/storage/sqlite.js'

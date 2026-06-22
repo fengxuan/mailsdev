@@ -654,6 +654,135 @@ describe('worker: POST /api/send', () => {
     expect(outboundInsert.provider).toBe('resend')
   })
 
+  test('sends email via ZeptoMail and records outbound', async () => {
+    const { db, prepareMock, bindMock } = createMockD1()
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      ZEPTOMAIL_API_KEY: 'zt_test_key',
+      EMAIL_PROVIDERS: 'zeptomail',
+    })
+
+    globalThis.fetch = mock(() =>
+      Promise.resolve(Response.json({ request_id: 'zepto-id-123' }, { status: 200 })),
+    ) as typeof fetch
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(SEND_BODY),
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { id: string; from: string; provider: string }
+
+    expect(response.status).toBe(200)
+    expect(json.id).toBe('zepto-id-123')
+    expect(json.from).toBe('me@example.com')
+    expect(json.provider).toBe('zeptomail')
+
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1)
+    const [zeptoUrl, zeptoInit] = (globalThis.fetch as any).mock.calls[0]
+    expect(zeptoUrl).toBe('https://api.zeptomail.com/v1.1/email')
+    expect(zeptoInit.method).toBe('POST')
+    expect(zeptoInit.headers['Authorization']).toBe('Zoho-enczapikey zt_test_key')
+    const zeptoBody = JSON.parse(zeptoInit.body)
+    expect(zeptoBody.from).toEqual({ address: 'me@example.com' })
+    expect(zeptoBody.to).toEqual([{ email_address: { address: 'you@example.com' } }])
+    expect(zeptoBody.subject).toBe('Hello')
+    expect(zeptoBody.textbody).toBe('World')
+
+    expect(prepareMock).toHaveBeenCalledTimes(3)
+    expect(bindMock).toHaveBeenCalledTimes(3)
+    const outboundInsert = decodeOutboundEmailInsertArgs((bindMock as any).mock.calls.at(-1) ?? [])
+    expect(outboundInsert.id).toBe('zepto-id-123')
+    expect(outboundInsert.provider).toBe('zeptomail')
+  })
+
+  test('prefers ZeptoMail before Resend when both are configured by default', async () => {
+    const { db } = createMockD1()
+    const env = singleMailboxEnv('me@example.com', {
+      DB: db,
+      RESEND_API_KEY: 're_test_key',
+      ZEPTOMAIL_API_KEY: 'zt_test_key',
+    })
+
+    globalThis.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'https://api.zeptomail.com/v1.1/email') {
+        return Promise.resolve(Response.json({ request_id: 'zepto-default-123' }, { status: 200 }))
+      }
+      return Promise.resolve(Response.json({ id: 'resend-should-not-run' }, { status: 200 }))
+    }) as typeof fetch
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(SEND_BODY),
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { id: string; provider: string }
+
+    expect(response.status).toBe(200)
+    expect(json.id).toBe('zepto-default-123')
+    expect(json.provider).toBe('zeptomail')
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1)
+    expect(String((globalThis.fetch as any).mock.calls[0][0])).toBe('https://api.zeptomail.com/v1.1/email')
+  })
+
+  test('uses provider-specific sender domains across ZeptoMail and Resend fallback', async () => {
+    const { db } = createMockD1()
+    const env = singleMailboxEnv('me@canyin.uk', {
+      DB: db,
+      RESEND_API_KEY: 're_test_key',
+      RESEND_FROM_EMAIL: 'chat@canyin.uk',
+      ZEPTOMAIL_API_KEY: 'zt_test_key',
+      ZEPTOMAIL_FROM_EMAIL: 'chat@yepage.net',
+    })
+
+    globalThis.fetch = mock((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://api.zeptomail.com/v1.1/email') {
+        return Promise.resolve(Response.json({
+          error: {
+            message: 'sender rejected',
+          },
+        }, { status: 500 }))
+      }
+      if (url === 'https://api.resend.com/emails') {
+        return Promise.resolve(Response.json({ id: 'resend-fallback-id' }, { status: 200 }))
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const request = authedRequest('http://localhost/api/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...SEND_BODY,
+        from: 'Agent <me@canyin.uk>',
+      }),
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { id: string; provider: string }
+
+    expect(response.status).toBe(200)
+    expect(json.id).toBe('resend-fallback-id')
+    expect(json.provider).toBe('resend')
+    expect((globalThis.fetch as any).mock.calls).toHaveLength(2)
+
+    const [, zeptoInit] = (globalThis.fetch as any).mock.calls[0]
+    const zeptoBody = JSON.parse(zeptoInit.body)
+    expect(zeptoBody.from).toEqual({ address: 'chat@yepage.net', name: 'Agent' })
+    expect(zeptoBody.reply_to).toEqual([{ address: 'me@canyin.uk' }])
+
+    const [, resendInit] = (globalThis.fetch as any).mock.calls[1]
+    const resendBody = JSON.parse(resendInit.body)
+    expect(resendBody.from).toBe('Agent <chat@canyin.uk>')
+    expect(resendBody.reply_to).toBe('me@canyin.uk')
+  })
+
   test('returns 400 for missing fields', async () => {
     const { db } = createMockD1()
     const env = singleMailboxEnv('me@example.com', { DB: db, RESEND_API_KEY: 're_test_key' })

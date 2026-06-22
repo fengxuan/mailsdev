@@ -16,16 +16,25 @@ service = "mails-realtime-notify"
 [vars]
 MAILBOX = "chat@canyin.uk"
 OUTBOUND_FROM_EMAIL = "chat@canyin.uk"
+RESEND_FROM_EMAIL = "chat@canyin.uk"
+ZEPTOMAIL_FROM_EMAIL = "chat@yepage.net"
 REALTIME_NOTIFY_BASE_URL = "https://mails-realtime-internal.canyin.uk"
 
 # ---- Outbound email providers ----
 #
-# Default provider chain = "cloudflare,resend,ses" (providers lacking
+# Default provider chain = "cloudflare,zeptomail,resend,ses" (providers lacking
 # configuration are silently skipped). Override with:
-#   wrangler secret put EMAIL_PROVIDERS   # e.g. "resend" or "cloudflare,resend,ses"
+#   wrangler secret put EMAIL_PROVIDERS   # e.g. "zeptomail", "resend", or "cloudflare,zeptomail,resend,ses"
 #
 # Provider: Resend — set the API key as a secret:
 #   wrangler secret put RESEND_API_KEY
+# Optional verified sender override when Resend uses a dedicated domain:
+#   RESEND_FROM_EMAIL=chat@canyin.uk
+#
+# Provider: ZeptoMail — set the API key as a secret:
+#   wrangler secret put ZEPTOMAIL_API_KEY
+# Optional verified sender override when ZeptoMail uses a different domain:
+#   ZEPTOMAIL_FROM_EMAIL=chat@yepage.net
 #
 # Provider: AWS SES — set Worker secrets:
 #   wrangler secret put AWS_SES_REGION

@@ -1,5 +1,6 @@
 export * from './types'
 export { CloudflareProvider, type CloudflareEmailBinding } from './cloudflare'
 export { ResendProvider } from './resend'
+export { ZeptoMailProvider } from './zeptomail'
 export { SESProvider } from './ses'
 export { buildProviderChain, sendWithChain, type ChainEnv } from './chain'

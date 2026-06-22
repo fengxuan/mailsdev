@@ -55,13 +55,13 @@ Email infrastructure for AI agents. Send and receive emails programmatically.
 
 ## Features
 
-- **Send emails** via a provider chain — Cloudflare Email Service (native `env.EMAIL.send()` binding, public beta) with Resend and AWS SES as fallbacks; default order is `cloudflare,resend,ses`, override with `EMAIL_PROVIDERS`
+- **Send emails** via a provider chain — Cloudflare Email Service (native `env.EMAIL.send()` binding, public beta) with ZeptoMail, Resend, and AWS SES as fallbacks; default order is `cloudflare,zeptomail,resend,ses`, override with `EMAIL_PROVIDERS`
 - **Receive emails** via Cloudflare Email Routing Worker
 - **Search inbox** — keyword search across subject, body, sender, code
 - **Verification code extraction** — auto-extracts codes from emails (EN/ZH/JA/KO)
 - **Attachments** — send files via CLI (`--attach`) or SDK, receive and parse MIME attachments
 - **Storage providers** — local SQLite, [db9.ai](https://db9.ai) cloud PostgreSQL, or remote Worker API
-- **Provider transparency** — `/api/send` response and `/api/inbox` outbound rows carry a `provider` field (`cloudflare`/`ses`/`resend`) so you can see which backend actually delivered
+- **Provider transparency** — `/api/send` response and `/api/inbox` outbound rows carry a `provider` field (`cloudflare`/`resend`/`zeptomail`/`ses`) so you can see which backend actually delivered
 - **Zero runtime dependencies** — providers call Workers bindings or raw `fetch()` directly, no SDK
 - **Hosted service** — free `@mails.dev` mailboxes via `mails claim`
 - **Self-hosted** — deploy your own Worker with mailbox-scoped auth tokens
@@ -90,7 +90,7 @@ mails inbox --query "password"       # Search emails
 mails code --to myagent@mails.dev    # Wait for verification code
 ```
 
-No Resend key needed — hosted users get 100 free sends/month. For unlimited sending, set your own key: `mails config set resend_api_key re_YOUR_KEY`
+No provider key needed — hosted users get 100 free sends/month. For direct sending with your own account, set either `mails config set resend_api_key re_YOUR_KEY` or `mails config set zeptomail_api_key zt_YOUR_KEY`
 
 ### Self-Hosted
 
@@ -98,17 +98,21 @@ No Resend key needed — hosted users get 100 free sends/month. For unlimited se
 cd worker && wrangler deploy             # Deploy your own Worker
 # Choose at least one outbound provider:
 wrangler secret put RESEND_API_KEY       # Option A: Resend
-wrangler secret put AWS_SES_REGION       # Option B: AWS SES
+wrangler secret put ZEPTOMAIL_API_KEY    # Option B: ZeptoMail
+wrangler secret put AWS_SES_REGION       # Option C: AWS SES
 wrangler secret put AWS_ACCESS_KEY_ID
 wrangler secret put AWS_SECRET_ACCESS_KEY
 # wrangler secret put AWS_SESSION_TOKEN  # Optional for temporary AWS credentials
 # wrangler secret put AWS_SES_ENDPOINT   # Optional custom endpoint / AWS partition
-#   Option C: Cloudflare Email Service (public beta) — add to wrangler.toml:
+#   Option D: Cloudflare Email Service (public beta) — add to wrangler.toml:
 #   [[send_email]]
 #   name = "EMAIL"
-# Providers can be combined; default chain stays on cloudflare → resend → ses.
+# Providers can be combined; default chain stays on cloudflare → zeptomail → resend → ses.
 # Use EMAIL_PROVIDERS to force order or disable providers, for example:
-#   wrangler secret put EMAIL_PROVIDERS   # e.g. "resend", "ses,resend", or "cloudflare,resend,ses"
+#   wrangler secret put EMAIL_PROVIDERS   # e.g. "zeptomail", "resend", "ses,zeptomail", or "cloudflare,zeptomail,resend,ses"
+# If different providers verify different sender domains, pin per-provider sender addresses:
+#   ZEPTOMAIL_FROM_EMAIL=chat@yepage.net
+#   RESEND_FROM_EMAIL=chat@canyin.uk
 # SES currently supports standard text/html sends; attachment requests will fall back to later providers such as Resend.
 #
 # Single mailbox:
@@ -344,6 +348,7 @@ Queries the Worker HTTP API directly. Auto-enabled when `api_key` or `worker_url
 | `worker_url` | | Self-hosted Worker URL |
 | `worker_token` | | Mailbox token for self-hosted Worker |
 | `resend_api_key` | | Resend API key |
+| `zeptomail_api_key` | | ZeptoMail API key |
 | `default_from` | | Default sender address |
 | `storage_provider` | auto | `sqlite`, `db9`, or `remote` |
 

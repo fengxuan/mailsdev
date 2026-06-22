@@ -98,7 +98,7 @@ describe('CLI: config command', () => {
   test('config loads defaults for missing file', () => {
     const config = loadConfig()
     expect(config.mode).toBe('hosted')
-    expect(config.send_provider).toBe('resend')
+    expect(config.send_provider).toBe('zeptomail')
   })
 
   test('config command masks secrets in set output and default display', async () => {
@@ -124,7 +124,7 @@ describe('CLI: config command', () => {
       mode: 'hosted',
       domain: 'mails.dev',
       mailbox: 'agent@mails.dev',
-      send_provider: 'resend',
+      send_provider: 'zeptomail',
       storage_provider: 'sqlite',
       api_key: 'mk_secret_value_12345678',
     })

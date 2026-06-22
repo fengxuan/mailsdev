@@ -11,7 +11,7 @@ const DEFAULT_CONFIG: MailsConfig = {
   mode: 'hosted',
   domain: 'mails.dev',
   mailbox: '',
-  send_provider: 'resend',
+  send_provider: 'zeptomail',
   storage_provider: 'sqlite',
 }
 

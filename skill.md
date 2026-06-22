@@ -189,6 +189,7 @@ Pulls emails from your Worker (hosted or self-hosted) into local SQLite. Useful 
 | `mailbox` | `mails claim` | Your receiving address |
 | `api_key` | `mails claim` | API key for hosted mails.dev service (mk_...) |
 | `resend_api_key` | manual | Resend API key for sending emails |
+| `zeptomail_api_key` | manual | ZeptoMail API key for sending emails |
 | `default_from` | manual | Default sender address |
 | `storage_provider` | manual | `sqlite`, `db9`, or `remote` (auto-detected) |
 | `worker_url` | manual | Self-hosted Worker URL (enables remote provider) |
@@ -205,7 +206,9 @@ wrangler d1 create mails
 # Edit wrangler.toml — set your D1 database ID
 wrangler d1 execute mails --file=schema.sql
 wrangler deploy
-wrangler secret put RESEND_API_KEY       # Enable sending via Worker
+wrangler secret put RESEND_API_KEY       # Option A: Resend
+wrangler secret put ZEPTOMAIL_API_KEY    # Option B: ZeptoMail
+# Providers can be combined; default order is cloudflare → zeptomail → resend → ses.
 # Single mailbox:
 #   MAILBOX=agent@yourdomain.com
 #   AUTH_TOKEN=YOUR_MAILBOX_TOKEN

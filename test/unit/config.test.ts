@@ -9,7 +9,7 @@ describe('config', () => {
       mode: 'hosted',
       domain: 'mails.dev',
       mailbox: '',
-      send_provider: 'resend',
+      send_provider: 'zeptomail',
       storage_provider: 'sqlite',
     })
   })
@@ -18,7 +18,7 @@ describe('config', () => {
     const config = loadConfig()
     expect(config.mode).toBe('hosted')
     expect(config.domain).toBe('mails.dev')
-    expect(config.send_provider).toBe('resend')
+    expect(config.send_provider).toBe('zeptomail')
     expect(config.storage_provider).toBe('sqlite')
     expect(config.mailbox).toBe('')
   })

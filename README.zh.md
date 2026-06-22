@@ -55,13 +55,13 @@
 
 ## 特性
 
-- **发送邮件** — 多 provider 链：Cloudflare Email Service（原生 `env.EMAIL.send()` binding，公开 beta）与 Resend / AWS SES 互为兜底；默认顺序 `cloudflare,resend,ses`，通过 `EMAIL_PROVIDERS` 覆盖
+- **发送邮件** — 多 provider 链：Cloudflare Email Service（原生 `env.EMAIL.send()` binding，公开 beta）与 ZeptoMail / Resend / AWS SES 互为兜底；默认顺序 `cloudflare,zeptomail,resend,ses`，通过 `EMAIL_PROVIDERS` 覆盖
 - **接收邮件** — 通过 Cloudflare Email Routing Worker
 - **搜索收件箱** — 按关键词搜索主题、正文、发件人、验证码
 - **验证码自动提取** — 自动从邮件中提取验证码（支持中/英/日/韩）
 - **附件** — CLI `--attach` 或 SDK 发送，Worker 自动解析 MIME 附件
 - **存储 Provider** — 本地 SQLite、[db9.ai](https://db9.ai) 云端 PostgreSQL、或远程 Worker API
-- **Provider 可见性** — `/api/send` 响应与 `/api/inbox` 的 outbound 行携带 `provider` 字段（`cloudflare`/`ses`/`resend`），知道是谁真正投递的
+- **Provider 可见性** — `/api/send` 响应与 `/api/inbox` 的 outbound 行携带 `provider` 字段（`cloudflare`/`resend`/`zeptomail`/`ses`），知道是谁真正投递的
 - **零运行时依赖** — provider 全部走 Workers binding 或原生 `fetch()`，不引 SDK
 - **托管服务** — 通过 `mails claim` 免费获取 `@mails.dev` 邮箱
 - **自部署** — 部署自己的 Worker，并使用 mailbox 级 token 鉴权
@@ -90,7 +90,7 @@ mails inbox --query "密码"            # 搜索邮件
 mails code --to myagent@mails.dev    # 等待验证码
 ```
 
-无需 Resend key — 托管用户每月 100 封免费发件。无限发送请配置自己的 key：`mails config set resend_api_key re_YOUR_KEY`
+无需 provider key — 托管用户每月 100 封免费发件。要改成直连自己的账号发送，可配置 `mails config set resend_api_key re_YOUR_KEY` 或 `mails config set zeptomail_api_key zt_YOUR_KEY`
 
 ### 自部署模式
 
@@ -98,17 +98,21 @@ mails code --to myagent@mails.dev    # 等待验证码
 cd worker && wrangler deploy             # 部署你自己的 Worker
 # 至少配置一个发送 provider：
 wrangler secret put RESEND_API_KEY       # 选项 A：Resend
-wrangler secret put AWS_SES_REGION       # 选项 B：AWS SES
+wrangler secret put ZEPTOMAIL_API_KEY    # 选项 B：ZeptoMail
+wrangler secret put AWS_SES_REGION       # 选项 C：AWS SES
 wrangler secret put AWS_ACCESS_KEY_ID
 wrangler secret put AWS_SECRET_ACCESS_KEY
 # wrangler secret put AWS_SESSION_TOKEN  # 临时 AWS 凭证时可选
 # wrangler secret put AWS_SES_ENDPOINT   # 自定义 endpoint / AWS 分区时可选
-#   选项 C：Cloudflare Email Service（公开 beta）— 在 wrangler.toml 中添加：
+#   选项 D：Cloudflare Email Service（公开 beta）— 在 wrangler.toml 中添加：
 #   [[send_email]]
 #   name = "EMAIL"
-# 可以同时配置多个 provider；默认链顺序 cloudflare → resend → ses。
+# 可以同时配置多个 provider；默认链顺序 cloudflare → zeptomail → resend → ses。
 # 如需强制顺序或禁用某个 provider，可设置：
-#   wrangler secret put EMAIL_PROVIDERS   # 例如 "resend"、"ses,resend"、"cloudflare,resend,ses"
+#   wrangler secret put EMAIL_PROVIDERS   # 例如 "zeptomail"、"resend"、"ses,zeptomail"、"cloudflare,zeptomail,resend,ses"
+# 如果不同 provider 验证的是不同发件域名，建议分别固定发件地址：
+#   ZEPTOMAIL_FROM_EMAIL=chat@yepage.net
+#   RESEND_FROM_EMAIL=chat@canyin.uk
 # 当前 SES 先支持标准 text/html 发送；带附件请求会回退到后续 provider（如 Resend）。
 #
 # 单邮箱：
@@ -328,6 +332,7 @@ mails config set db9_database_id YOUR_DB_ID
 | `worker_url` | | 自部署 Worker URL |
 | `worker_token` | | 自部署 Worker 的 mailbox token |
 | `resend_api_key` | | Resend API 密钥 |
+| `zeptomail_api_key` | | ZeptoMail API 密钥 |
 | `default_from` | | 默认发件人地址 |
 | `storage_provider` | auto | `sqlite`、`db9` 或 `remote` |
 

@@ -1,5 +1,6 @@
 import { CloudflareProvider, type CloudflareEmailBinding } from './cloudflare'
 import { ResendProvider } from './resend'
+import { ZeptoMailProvider } from './zeptomail'
 import { SESProvider } from './ses'
 import {
   AllProvidersFailedError,
@@ -11,8 +12,12 @@ import {
 } from './types'
 
 export interface ChainEnv {
+  OUTBOUND_FROM_EMAIL?: string
+  RESEND_FROM_EMAIL?: string
+  ZEPTOMAIL_FROM_EMAIL?: string
   EMAIL?: CloudflareEmailBinding
   RESEND_API_KEY?: string
+  ZEPTOMAIL_API_KEY?: string
   AWS_SES_REGION?: string
   AWS_ACCESS_KEY_ID?: string
   AWS_SECRET_ACCESS_KEY?: string
@@ -21,30 +26,38 @@ export interface ChainEnv {
   EMAIL_PROVIDERS?: string
 }
 
-const DEFAULT_ORDER: ProviderName[] = ['cloudflare', 'resend', 'ses']
+const DEFAULT_ORDER: ProviderName[] = ['cloudflare', 'zeptomail', 'resend', 'ses']
 
 export function buildProviderChain(env: ChainEnv, fetchImpl: typeof fetch = fetch): EmailProvider[] {
   const order = parseOrder(env.EMAIL_PROVIDERS)
   const chain: EmailProvider[] = []
   for (const name of order) {
     if (name === 'cloudflare' && env.EMAIL && typeof env.EMAIL.send === 'function') {
-      chain.push(new CloudflareProvider(env.EMAIL))
+      chain.push(withFixedFrom(new CloudflareProvider(env.EMAIL), env.OUTBOUND_FROM_EMAIL))
     } else if (name === 'resend' && env.RESEND_API_KEY) {
-      chain.push(new ResendProvider(env.RESEND_API_KEY, fetchImpl))
+      chain.push(withFixedFrom(
+        new ResendProvider(env.RESEND_API_KEY, fetchImpl),
+        env.RESEND_FROM_EMAIL ?? env.OUTBOUND_FROM_EMAIL,
+      ))
+    } else if (name === 'zeptomail' && env.ZEPTOMAIL_API_KEY) {
+      chain.push(withFixedFrom(
+        new ZeptoMailProvider(env.ZEPTOMAIL_API_KEY, fetchImpl),
+        env.ZEPTOMAIL_FROM_EMAIL ?? env.OUTBOUND_FROM_EMAIL,
+      ))
     } else if (
       name === 'ses'
       && env.AWS_SES_REGION
       && env.AWS_ACCESS_KEY_ID
       && env.AWS_SECRET_ACCESS_KEY
     ) {
-      chain.push(new SESProvider({
+      chain.push(withFixedFrom(new SESProvider({
         accessKeyId: env.AWS_ACCESS_KEY_ID,
         secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
         ...(env.AWS_SESSION_TOKEN ? { sessionToken: env.AWS_SESSION_TOKEN } : {}),
       }, {
         region: env.AWS_SES_REGION,
         ...(env.AWS_SES_ENDPOINT ? { endpoint: env.AWS_SES_ENDPOINT } : {}),
-      }, fetchImpl))
+      }, fetchImpl), env.OUTBOUND_FROM_EMAIL))
     }
   }
   return chain
@@ -67,10 +80,17 @@ export async function sendWithChain(
     try {
       return await provider.send(req)
     } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err)
       attempts.push({
         provider: provider.name,
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessage,
       })
+      console.warn(JSON.stringify({
+        event: 'outbound_provider_failed',
+        source: 'mails-worker',
+        provider: provider.name,
+        error: errorMessage,
+      }))
     }
   }
 
@@ -95,7 +115,7 @@ function parseOrder(raw: string | undefined): ProviderName[] {
   const valid: ProviderName[] = []
   const seen = new Set<string>()
   for (const name of names) {
-    if (name === 'cloudflare' || name === 'resend' || name === 'ses') {
+    if (name === 'cloudflare' || name === 'resend' || name === 'zeptomail' || name === 'ses') {
       if (!seen.has(name)) {
         valid.push(name)
         seen.add(name)
@@ -103,4 +123,54 @@ function parseOrder(raw: string | undefined): ProviderName[] {
     }
   }
   return valid.length > 0 ? valid : DEFAULT_ORDER
+}
+
+function withFixedFrom(provider: EmailProvider, fixedFrom: string | undefined): EmailProvider {
+  if (!fixedFrom?.trim()) {
+    return provider
+  }
+
+  return {
+    name: provider.name,
+    supports(req) {
+      return provider.supports(rewriteSender(req, fixedFrom))
+    },
+    send(req) {
+      return provider.send(rewriteSender(req, fixedFrom))
+    },
+  }
+}
+
+function rewriteSender(req: SendRequest, fixedFrom: string): SendRequest {
+  const desiredAddress = normalizeMailbox(fixedFrom)
+  if (!desiredAddress) {
+    return req
+  }
+
+  const currentAddress = normalizeMailbox(req.from)
+  if (!currentAddress || currentAddress === desiredAddress) {
+    return req
+  }
+
+  return {
+    ...req,
+    from: replaceFromAddress(req.from, desiredAddress),
+    reply_to: req.reply_to ?? currentAddress,
+  }
+}
+
+function normalizeMailbox(value: string): string {
+  const match = value.match(/<([^>]+)>/)
+  return (match?.[1] ?? value).trim().toLowerCase()
+}
+
+function replaceFromAddress(from: string, newAddress: string): string {
+  const trimmed = from.trim()
+  const match = trimmed.match(/^(.*)<([^>]+)>$/)
+  if (!match) {
+    return newAddress
+  }
+
+  const prefix = match[1]?.trimEnd() ?? ''
+  return prefix ? `${prefix} <${newAddress}>` : newAddress
 }

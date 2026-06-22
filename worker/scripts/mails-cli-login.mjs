@@ -132,7 +132,7 @@ function loadConfig() {
     return {
       mode: 'hosted',
       domain: 'mails.dev',
-      send_provider: 'resend',
+      send_provider: 'zeptomail',
       storage_provider: 'remote',
     }
   }

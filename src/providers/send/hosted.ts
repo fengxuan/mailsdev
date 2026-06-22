@@ -43,7 +43,7 @@ export function createHostedSendProvider(apiKey: string, apiUrl?: string): SendP
 
       if (res.status === 402) {
         const msg = data.error ?? 'Monthly free limit reached'
-        throw new Error(`${msg}\n  Pay ${data.price ?? '$0.002'}/email with USDC, or use your own Resend key:\n  mails config set resend_api_key re_YOUR_KEY`)
+        throw new Error(`${msg}\n  Pay ${data.price ?? '$0.002'}/email with USDC, or use your own provider key:\n  mails config set resend_api_key re_YOUR_KEY\n  mails config set zeptomail_api_key zt_YOUR_KEY`)
       }
 
       if (!res.ok) {

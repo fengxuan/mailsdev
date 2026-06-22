@@ -21,10 +21,16 @@ export interface Env {
   AUTH_TOKENS_JSON?: string
   /** Internal token used by trusted services to act on behalf of any mailbox. */
   INTERNAL_API_TOKEN?: string
-  /** Fixed sender address allowed for outbound mail, e.g. chat@canyin.uk. */
+  /** Canonical local mailbox sender used for local-domain routing and generic outbound fallback. */
   OUTBOUND_FROM_EMAIL?: string
+  /** Optional fixed sender address for Resend, e.g. chat@canyin.uk. */
+  RESEND_FROM_EMAIL?: string
   /** Resend API key for outbound email sending. */
   RESEND_API_KEY?: string
+  /** Optional fixed sender address for ZeptoMail, e.g. chat@yepage.net. */
+  ZEPTOMAIL_FROM_EMAIL?: string
+  /** ZeptoMail API key for outbound email sending. */
+  ZEPTOMAIL_API_KEY?: string
   /** AWS SES region for outbound email sending, e.g. us-east-1. */
   AWS_SES_REGION?: string
   /** AWS access key id for SES API requests. */
@@ -44,9 +50,10 @@ export interface Env {
   /** Internal bearer token required by the realtime notify Worker. */
   REALTIME_INTERNAL_TOKEN?: string
   /**
-   * Ordered provider preference list, e.g. "cloudflare,resend,ses".
-   * Defaults to "cloudflare,resend,ses"; providers lacking configuration are
-   * silently skipped so existing Resend-only deployments continue to work.
+   * Ordered provider preference list, e.g. "cloudflare,zeptomail,resend,ses".
+   * Defaults to "cloudflare,zeptomail,resend,ses"; providers lacking
+   * configuration are silently skipped so existing deployments continue to
+   * work.
    */
   EMAIL_PROVIDERS?: string
 }
@@ -928,7 +935,7 @@ async function handleSend(
     attachments: sendReq.attachments,
   }
 
-  let result: { id: string; provider: 'cloudflare' | 'resend' | 'ses' }
+  let result: { id: string; provider: 'cloudflare' | 'resend' | 'zeptomail' | 'ses' }
   try {
     result = await sendWithChain(chain, filteredSendReq)
   } catch (err) {
@@ -1099,7 +1106,7 @@ async function persistOutboundEmail(
     headers?: Record<string, string>
     messageId?: string | null
     attachmentCount: number
-    provider: 'cloudflare' | 'resend' | 'ses' | 'local'
+    provider: 'cloudflare' | 'resend' | 'zeptomail' | 'ses' | 'local'
     receivedAt: string
   },
 ): Promise<void> {
