@@ -134,29 +134,34 @@ function withFixedFrom(provider: EmailProvider, fixedFrom: string | undefined): 
   return {
     name: provider.name,
     supports(req) {
-      return provider.supports(rewriteSender(req, fixedFrom))
+      return provider.supports(normalizeProviderRequest(req, fixedFrom))
     },
     send(req) {
-      return provider.send(rewriteSender(req, fixedFrom))
+      return provider.send(normalizeProviderRequest(req, fixedFrom))
     },
   }
 }
 
-function rewriteSender(req: SendRequest, fixedFrom: string): SendRequest {
-  const desiredAddress = normalizeMailbox(fixedFrom)
-  if (!desiredAddress) {
-    return req
+function normalizeProviderRequest(req: SendRequest, fixedFrom: string): SendRequest {
+  const { use_provider_default_sender: useProviderDefaultSender, ...baseReq } = req
+  if (useProviderDefaultSender !== true) {
+    return baseReq
   }
 
-  const currentAddress = normalizeMailbox(req.from)
+  const desiredAddress = normalizeMailbox(fixedFrom)
+  if (!desiredAddress) {
+    return baseReq
+  }
+
+  const currentAddress = normalizeMailbox(baseReq.from)
   if (!currentAddress || currentAddress === desiredAddress) {
-    return req
+    return baseReq
   }
 
   return {
-    ...req,
-    from: replaceFromAddress(req.from, desiredAddress),
-    reply_to: req.reply_to ?? currentAddress,
+    ...baseReq,
+    from: replaceFromAddress(baseReq.from, desiredAddress),
+    reply_to: baseReq.reply_to ?? currentAddress,
   }
 }
 

@@ -225,7 +225,9 @@ export default {
             if (request.method !== 'POST') {
               response = Response.json({ error: 'Method not allowed' }, { status: 405 })
             } else {
-              response = await handleSend(request, env, auth.mailbox, ctx)
+              response = await handleSend(request, env, auth.mailbox, ctx, {
+                allowProviderDefaultSender: false,
+              })
             }
             break
           case '/api/sync':
@@ -260,7 +262,9 @@ export default {
             if (request.method !== 'POST') {
               response = Response.json({ error: 'Method not allowed' }, { status: 405 })
             } else {
-              response = await handleSend(request, env, auth.mailbox, ctx)
+              response = await handleSend(request, env, auth.mailbox, ctx, {
+                allowProviderDefaultSender: true,
+              })
             }
             break
           case '/internal/mailbox/delete':
@@ -289,9 +293,8 @@ export default {
   },
 
   async email(message: ForwardableEmailMessage, env: Env, ctx?: ExecutionContext): Promise<void> {
-    const to = message.to
     const from = message.from
-    const mailbox = normalizeMailbox(to)
+    const mailbox = resolveInboundMailbox(env, message)
     const fromAddress = normalizeMailbox(message.headers.get('from') ?? from)
     if (await isDeletedMailbox(env, mailbox)) {
       return
@@ -733,6 +736,7 @@ async function handleSend(
   env: Env,
   authorizedMailbox: string,
   ctx?: ExecutionContext,
+  options?: { allowProviderDefaultSender?: boolean },
 ): Promise<Response> {
   const body = await request.json() as {
     from?: string
@@ -741,6 +745,7 @@ async function handleSend(
     text?: string
     html?: string
     reply_to?: string
+    use_provider_default_sender?: boolean
     headers?: Record<string, string>
     skip_sender_realtime_ack?: boolean
     cc?: string[]
@@ -748,26 +753,30 @@ async function handleSend(
     attachments?: Array<{ filename: string; content: string; content_type?: string }>
   }
 
-  if (!body.from || !body.to?.length || !body.subject) {
-    return Response.json({ error: 'Missing required fields: from, to, subject' }, { status: 400 })
+  if (!body.to?.length || !body.subject) {
+    return Response.json({ error: 'Missing required fields: to, subject' }, { status: 400 })
   }
   if (!body.text && !body.html) {
     return Response.json({ error: 'Either text or html is required' }, { status: 400 })
   }
 
-  const senderMailbox = normalizeMailbox(body.from)
+  const requestedFrom = body.from?.trim() || authorizedMailbox
+  const senderMailbox = normalizeMailbox(requestedFrom)
   const allowedSender = normalizeMailbox(authorizedMailbox)
-  if (senderMailbox !== allowedSender) {
+  if (body.from && senderMailbox !== allowedSender) {
     return Response.json({ error: 'Forbidden' }, { status: 403 })
   }
+  const useProviderDefaultSender = options?.allowProviderDefaultSender === true
+    && body.use_provider_default_sender === true
 
   const sendReq: SendRequest = {
-    from: body.from,
+    from: requestedFrom,
     to: body.to,
     subject: body.subject,
     text: body.text,
     html: body.html,
     reply_to: body.reply_to,
+    use_provider_default_sender: useProviderDefaultSender || undefined,
     headers: body.headers,
     cc: body.cc,
     bcc: body.bcc,
@@ -800,7 +809,7 @@ async function handleSend(
       ? normalizeMailbox(filteredTo[0] ?? '')
       : null
     const messageId = crypto.randomUUID()
-    const senderName = parseFromName(body.from)
+    const senderName = parseFromName(requestedFrom)
     const outboundReceivedAt = new Date().toISOString()
     await persistOutboundEmail(env, {
       id: messageId,
@@ -897,7 +906,7 @@ async function handleSend(
       }
     }
 
-    return Response.json({ id: messageId, from: body.from, provider: 'local' })
+    return Response.json({ id: messageId, from: requestedFrom, provider: 'local' })
   }
 
   if (filteredRecipients.length === 0) {
@@ -907,7 +916,7 @@ async function handleSend(
       id: messageId,
       mailbox: authorizedMailbox,
       fromAddress: senderMailbox,
-      fromName: parseFromName(body.from),
+      fromName: parseFromName(requestedFrom),
       toAddress: body.to.join(', '),
       subject: body.subject,
       bodyText: body.text,
@@ -918,7 +927,7 @@ async function handleSend(
       provider: 'local',
       receivedAt: now,
     })
-    return Response.json({ id: messageId, from: body.from, provider: 'local' })
+    return Response.json({ id: messageId, from: requestedFrom, provider: 'local' })
   }
 
   const chain = buildProviderChain(env)
@@ -933,6 +942,7 @@ async function handleSend(
     text: sendReq.text,
     html: sendReq.html,
     reply_to: sendReq.reply_to,
+    use_provider_default_sender: sendReq.use_provider_default_sender,
     headers: sendReq.headers,
     cc: filteredCc.length ? filteredCc : undefined,
     bcc: filteredBcc.length ? filteredBcc : undefined,
@@ -957,7 +967,7 @@ async function handleSend(
     id: result.id,
     mailbox: authorizedMailbox,
     fromAddress: senderMailbox,
-    fromName: parseFromName(body.from),
+    fromName: parseFromName(requestedFrom),
     toAddress: filteredTo.join(', '),
     subject: body.subject,
     bodyText: body.text,
@@ -976,7 +986,7 @@ async function handleSend(
       if (isDirectRecipient) {
         scheduleRealtimeNotifyForDirectOutboundSender(env, ctx, {
           senderMailbox,
-          senderName: parseFromName(body.from),
+          senderName: parseFromName(requestedFrom),
           subject: body.subject,
           bodyText: body.text,
           bodyHtml: body.html,
@@ -1000,7 +1010,7 @@ async function handleSend(
     }
   }
 
-  return Response.json({ id: result.id, from: body.from, provider: result.provider })
+  return Response.json({ id: result.id, from: requestedFrom, provider: result.provider })
 }
 
 async function classifyLocalRecipients(env: Env, recipients: string[]): Promise<LocalDeliveryClassification> {
@@ -1693,18 +1703,18 @@ async function maybeUpsertDirectExternalEmailThreadFromInbound(
     return
   }
 
-  const existingRows = (await env.DB.prepare(`
-    SELECT id, owner_mailbox, peer_email, topic_key, topic_label, anchor_message_id, references_chain, reply_subject, created_at, updated_at
-    FROM direct_external_email_threads
-    WHERE owner_mailbox = ? AND peer_email = ?
-    ORDER BY updated_at DESC, id DESC
-  `).bind(ownerMailbox, peerEmail).all<DirectExternalEmailThreadRow>()).results ?? []
-
+  const existingRows = await listDirectExternalEmailThreads(env, ownerMailbox, peerEmail)
   const normalizedReplySubject = normalizeReplySubject(input.subject)
-  const selectedThread = selectDirectExternalThreadForInbound(existingRows, {
+  const ancestryMatchedThread = selectDirectExternalThreadForInbound(existingRows, {
     inboundMessageID,
     headers: input.headers,
   })
+  const inboundTopicLabel = deriveTopicLabelFromReplySubject(normalizedReplySubject)
+  const topicKey = ancestryMatchedThread?.topic_key
+    ?? normalizeTopicKey(inboundTopicLabel)
+  const selectedThread = ancestryMatchedThread
+    ?? existingRows.find((row) => row.topic_key === topicKey)
+    ?? null
   const existingAnchor = normalizeMessageID(selectedThread?.anchor_message_id ?? null)
   if (existingAnchor === inboundMessageID || isMessageIDInReferencesChain(inboundMessageID, selectedThread?.references_chain ?? '')) {
     if (selectedThread && normalizedReplySubject && normalizedReplySubject !== (selectedThread.reply_subject ?? null)) {
@@ -1721,14 +1731,16 @@ async function maybeUpsertDirectExternalEmailThreadFromInbound(
     return
   }
 
-  const inboundReferencesChain = appendMessageIDToReferencesChain(buildNormalizedInboundReferencesChain(
-    selectedThread?.references_chain ?? '',
-    selectedThread?.anchor_message_id ?? '',
-    input.headers,
-  ), inboundMessageID)
-  const inboundTopicLabel = deriveTopicLabelFromReplySubject(normalizedReplySubject)
-  const topicKey = selectedThread?.topic_key
-    ?? normalizeTopicKey(inboundTopicLabel)
+  const inboundReferencesChain = appendMessageIDToReferencesChain(
+    selectedThread && !ancestryMatchedThread
+      ? buildReferencesHeader(selectedThread.references_chain, selectedThread.anchor_message_id)
+      : buildNormalizedInboundReferencesChain(
+        selectedThread?.references_chain ?? '',
+        selectedThread?.anchor_message_id ?? '',
+        input.headers,
+      ),
+    inboundMessageID,
+  )
 
   if (selectedThread) {
     await env.DB.prepare(`
@@ -1745,23 +1757,59 @@ async function maybeUpsertDirectExternalEmailThreadFromInbound(
     return
   }
 
-  await env.DB.prepare(`
-    INSERT INTO direct_external_email_threads (
-      id, owner_mailbox, peer_email, topic_key, topic_label, anchor_message_id, references_chain, reply_subject, created_at, updated_at
+  try {
+    await env.DB.prepare(`
+      INSERT INTO direct_external_email_threads (
+        id, owner_mailbox, peer_email, topic_key, topic_label, anchor_message_id, references_chain, reply_subject, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      ownerMailbox,
+      peerEmail,
+      topicKey,
+      null,
+      inboundMessageID,
+      inboundReferencesChain,
+      normalizedReplySubject,
+      input.receivedAt,
+      input.receivedAt,
+    ).run()
+  } catch (error) {
+    if (!isDirectExternalEmailThreadTopicConflict(error)) {
+      throw error
+    }
+
+    const concurrentRows = await listDirectExternalEmailThreads(env, ownerMailbox, peerEmail)
+    const concurrentThread = selectDirectExternalThreadForInbound(concurrentRows, {
+      inboundMessageID,
+      headers: input.headers,
+    }) ?? concurrentRows.find((row) => row.topic_key === topicKey) ?? null
+    if (!concurrentThread) {
+      return
+    }
+
+    const concurrentAnchor = normalizeMessageID(concurrentThread.anchor_message_id)
+    if (concurrentAnchor === inboundMessageID || isMessageIDInReferencesChain(inboundMessageID, concurrentThread.references_chain ?? '')) {
+      return
+    }
+
+    const concurrentReferencesChain = appendMessageIDToReferencesChain(
+      buildReferencesHeader(concurrentThread.references_chain, concurrentThread.anchor_message_id),
+      inboundMessageID,
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(
-    crypto.randomUUID(),
-    ownerMailbox,
-    peerEmail,
-    topicKey,
-    null,
-    inboundMessageID,
-    inboundReferencesChain,
-    normalizedReplySubject,
-    input.receivedAt,
-    input.receivedAt,
-  ).run()
+    await env.DB.prepare(`
+      UPDATE direct_external_email_threads
+      SET anchor_message_id = ?, references_chain = ?, reply_subject = ?, updated_at = ?
+      WHERE id = ?
+    `).bind(
+      inboundMessageID,
+      concurrentReferencesChain,
+      normalizedReplySubject,
+      input.receivedAt,
+      concurrentThread.id,
+    ).run()
+  }
 }
 
 function toInboxEmail(row: Record<string, unknown>) {
@@ -1900,6 +1948,38 @@ function normalizeSingleRecipient(value: string): string | null {
   return normalizeMailbox(trimmed)
 }
 
+function resolveOriginalRecipientHeader(headers: Headers): string | null {
+  const candidate = [
+    headers.get('x-original-to'),
+    headers.get('delivered-to'),
+    headers.get('envelope-to'),
+    headers.get('original-recipient'),
+  ]
+    .map((value) => normalizeSingleRecipient(value ?? ''))
+    .find((value): value is string => typeof value === 'string' && isValidEmail(value))
+
+  return candidate ?? null
+}
+
+function resolveInboundMailbox(env: Env, message: ForwardableEmailMessage): string {
+  const envelopeMailbox = normalizeMailbox(message.to)
+  const originalRecipient = resolveOriginalRecipientHeader(message.headers)
+  if (!originalRecipient || originalRecipient === envelopeMailbox) {
+    return envelopeMailbox
+  }
+
+  const serviceMailbox = normalizeMailbox(env.MAILBOX ?? '')
+  if (serviceMailbox && envelopeMailbox === serviceMailbox && isLocalMailbox(env, originalRecipient)) {
+    return originalRecipient
+  }
+
+  if (!isLocalMailbox(env, envelopeMailbox) && isLocalMailbox(env, originalRecipient)) {
+    return originalRecipient
+  }
+
+  return envelopeMailbox
+}
+
 function isValidEmail(value: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)
 }
@@ -1920,6 +2000,13 @@ function safeJsonParse<T>(value: string | null | undefined, fallback: T): T {
 function normalizeReplySubject(subject: string | null | undefined): string | null {
   const normalized = (subject ?? '').replace(/[\r\n]+/g, ' ').trim()
   return normalized || null
+}
+
+function isDirectExternalEmailThreadTopicConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return message.includes(
+    'UNIQUE constraint failed: direct_external_email_threads.owner_mailbox, direct_external_email_threads.peer_email, direct_external_email_threads.topic_key',
+  )
 }
 
 function stripReplySubjectPrefix(subject: string | null | undefined): string | null {

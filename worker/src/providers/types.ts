@@ -11,6 +11,7 @@ export interface SendRequest {
   text?: string
   html?: string
   reply_to?: string
+  use_provider_default_sender?: boolean
   headers?: Record<string, string>
   cc?: string[]
   bcc?: string[]

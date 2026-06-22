@@ -731,7 +731,7 @@ describe('worker: POST /api/send', () => {
     expect(String((globalThis.fetch as any).mock.calls[0][0])).toBe('https://api.zeptomail.eu/v1.1/email')
   })
 
-  test('uses provider-specific sender domains across ZeptoMail and Resend fallback', async () => {
+  test('preserves explicit sender across ZeptoMail and Resend fallback', async () => {
     const { db } = createMockD1()
     const env = singleMailboxEnv('me@canyin.uk', {
       DB: db,
@@ -775,13 +775,74 @@ describe('worker: POST /api/send', () => {
 
     const [, zeptoInit] = (globalThis.fetch as any).mock.calls[0]
     const zeptoBody = JSON.parse(zeptoInit.body)
-    expect(zeptoBody.from).toEqual({ address: 'chat@yepage.net', name: 'Agent' })
-    expect(zeptoBody.reply_to).toEqual([{ address: 'me@canyin.uk' }])
+    expect(zeptoBody.from).toEqual({ address: 'me@canyin.uk', name: 'Agent' })
+    expect(zeptoBody.reply_to).toBeUndefined()
 
     const [, resendInit] = (globalThis.fetch as any).mock.calls[1]
     const resendBody = JSON.parse(resendInit.body)
-    expect(resendBody.from).toBe('Agent <chat@canyin.uk>')
-    expect(resendBody.reply_to).toBe('me@canyin.uk')
+    expect(resendBody.from).toBe('Agent <me@canyin.uk>')
+    expect(resendBody.reply_to).toBeUndefined()
+  })
+
+  test('internal send can opt into provider-default sender fallback', async () => {
+    const { db } = createMockD1()
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      RESEND_API_KEY: 're_test_key',
+      RESEND_FROM_EMAIL: 'chat@canyin.uk',
+      ZEPTOMAIL_API_KEY: 'zt_test_key',
+      ZEPTOMAIL_FROM_EMAIL: 'chat@yepage.net',
+    } as Env
+
+    globalThis.fetch = mock((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://api.zeptomail.eu/v1.1/email') {
+        return Promise.resolve(Response.json({
+          error: {
+            message: 'sender rejected',
+          },
+        }, { status: 500 }))
+      }
+      if (url === 'https://api.resend.com/emails') {
+        return Promise.resolve(Response.json({ id: 'resend-fallback-id' }, { status: 200 }))
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const request = new Request('http://localhost/internal/send', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer internal-token',
+        'Content-Type': 'application/json',
+        'X-Mailbox': 'group@canyin.uk',
+      },
+      body: JSON.stringify({
+        to: ['you@example.com'],
+        subject: 'System notice',
+        text: 'World',
+        use_provider_default_sender: true,
+      }),
+    })
+
+    const response = await worker.fetch(request, env)
+    const json = await response.json() as { id: string; provider: string; from: string }
+
+    expect(response.status).toBe(200)
+    expect(json.id).toBe('resend-fallback-id')
+    expect(json.provider).toBe('resend')
+    expect(json.from).toBe('group@canyin.uk')
+    expect((globalThis.fetch as any).mock.calls).toHaveLength(2)
+
+    const [, zeptoInit] = (globalThis.fetch as any).mock.calls[0]
+    const zeptoBody = JSON.parse(zeptoInit.body)
+    expect(zeptoBody.from).toEqual({ address: 'chat@yepage.net' })
+    expect(zeptoBody.reply_to).toEqual([{ address: 'group@canyin.uk' }])
+
+    const [, resendInit] = (globalThis.fetch as any).mock.calls[1]
+    const resendBody = JSON.parse(resendInit.body)
+    expect(resendBody.from).toBe('chat@canyin.uk')
+    expect(resendBody.reply_to).toBe('group@canyin.uk')
   })
 
   test('returns 400 for missing fields', async () => {
@@ -1853,6 +1914,144 @@ describe('worker: inbound email realtime notify', () => {
     expect(preparedSQL.some((sql: string) => sql.includes('FROM emails') && sql.includes('peer_address = ?'))).toBe(false)
   })
 
+  test('direct inbound email on a secondary mailbox domain emits realtime conversation update', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      directUsersByMailbox: {
+        'recipient@yepage.net': 'user-recipient-yepage',
+      },
+    })
+    const env = {
+      DB: db,
+      INTERNAL_MAILBOX_DOMAINS: 'canyin.uk,yepage.net',
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    } as Env
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify') {
+        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      if (url === 'https://realtime.example.com/internal/notify-batch') {
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        realtimeNotifyBodies.push(...(body.events ?? []))
+        return new Response(JSON.stringify({ ok: true, count: (body.events ?? []).length }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@yepage.net',
+      subject: 'Hi yepage',
+      bodyText: 'Hello yepage',
+    })
+    const harness = createExecutionContextHarness()
+    await worker.email(message, env, harness.ctx)
+    await harness.flush()
+
+    expect(realtimeNotifyBodies).toHaveLength(1)
+    expect(realtimeNotifyBodies[0]!.target.user_id).toBe('user-recipient-yepage')
+    expect(realtimeNotifyBodies[0]!.type).toBe('conversation_updated')
+    expect(realtimeNotifyBodies[0]!.data).toMatchObject({
+      peer: 'sender@example.com',
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      conversation: {
+        peer: 'sender@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        last_message: 'Hello yepage',
+        last_direction: 'inbound',
+        last_sender_email: 'sender@example.com',
+        last_sender_name: null,
+      },
+      message: {
+        peer: 'sender@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        direction: 'inbound',
+        text: 'Hello yepage',
+        status: 'received',
+        sender_email: 'sender@example.com',
+        sender_name: null,
+      },
+    })
+  })
+
+  test('email routing original-recipient headers route secondary-domain inbox mail to the user mailbox', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      directUsersByMailbox: {
+        'recipient@yepage.net': 'user-recipient-yepage-routed',
+      },
+    })
+    const env = {
+      DB: db,
+      MAILBOX: 'chat@canyin.uk',
+      INTERNAL_MAILBOX_DOMAINS: 'canyin.uk,yepage.net',
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    } as Env
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify') {
+        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      if (url === 'https://realtime.example.com/internal/notify-batch') {
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        realtimeNotifyBodies.push(...(body.events ?? []))
+        return new Response(JSON.stringify({ ok: true, count: (body.events ?? []).length }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'chat@canyin.uk',
+      subject: 'Hi routed yepage',
+      bodyText: 'Hello routed yepage',
+    })
+    message.headers.set('x-original-to', 'recipient@yepage.net')
+
+    const harness = createExecutionContextHarness()
+    await worker.email(message, env, harness.ctx)
+    await harness.flush()
+
+    expect(realtimeNotifyBodies).toHaveLength(1)
+    expect(realtimeNotifyBodies[0]!.target.user_id).toBe('user-recipient-yepage-routed')
+    expect(realtimeNotifyBodies[0]!.data).toMatchObject({
+      peer: 'sender@example.com',
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      conversation: {
+        peer: 'sender@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        last_message: 'Hello routed yepage',
+        last_direction: 'inbound',
+        last_sender_email: 'sender@example.com',
+      },
+      message: {
+        peer: 'sender@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        direction: 'inbound',
+        text: 'Hello routed yepage',
+        status: 'received',
+        sender_email: 'sender@example.com',
+      },
+    })
+  })
+
   test('external direct inbound email does not expose the raw email subject as realtime topic', async () => {
     const { db, directExternalEmailThreads } = createRealtimeRoutingMockD1({
       directUsersByMailbox: {
@@ -2230,7 +2429,12 @@ describe('worker: inbound email dedupe', () => {
   })
 })
 
-function createDirectExternalThreadTrackingMockD1(directExternalEmailThreads: DirectExternalEmailThreadRow[]) {
+function createDirectExternalThreadTrackingMockD1(
+  directExternalEmailThreads: DirectExternalEmailThreadRow[],
+  options: {
+    conflictOnInsertOnce?: boolean
+  } = {},
+) {
   for (const row of directExternalEmailThreads) {
     if (!row.topic_key) row.topic_key = 'default'
     if (row.topic_label === undefined) {
@@ -2285,12 +2489,20 @@ function createDirectExternalThreadTrackingMockD1(directExternalEmailThreads: Di
             first: mock(() => Promise.resolve(null)),
             all: mock(() => Promise.resolve({ results: [] })),
             run: mock(() => {
-              const existing = directExternalEmailThreads.find((row) => row.id === String(params[4]))
+              const updateId = sql.includes('SET reply_subject = ?, updated_at = ?')
+                ? String(params[2])
+                : String(params[4])
+              const existing = directExternalEmailThreads.find((row) => row.id === updateId)
               if (existing) {
-                existing.anchor_message_id = String(params[0])
-                existing.references_chain = String(params[1])
-                existing.reply_subject = params[2] === null ? null : String(params[2])
-                existing.updated_at = String(params[3])
+                if (sql.includes('SET reply_subject = ?, updated_at = ?')) {
+                  existing.reply_subject = params[0] === null ? null : String(params[0])
+                  existing.updated_at = String(params[1])
+                } else {
+                  existing.anchor_message_id = String(params[0])
+                  existing.references_chain = String(params[1])
+                  existing.reply_subject = params[2] === null ? null : String(params[2])
+                  existing.updated_at = String(params[3])
+                }
               }
               return Promise.resolve({ success: true })
             }),
@@ -2301,6 +2513,24 @@ function createDirectExternalThreadTrackingMockD1(directExternalEmailThreads: Di
             first: mock(() => Promise.resolve(null)),
             all: mock(() => Promise.resolve({ results: [] })),
             run: mock(() => {
+              if (options.conflictOnInsertOnce) {
+                options.conflictOnInsertOnce = false
+                directExternalEmailThreads.push({
+                  id: 'thread-race-winner',
+                  owner_mailbox: String(params[1]),
+                  peer_email: String(params[2]),
+                  topic_key: String(params[3]),
+                  topic_label: params[4] === null ? null : String(params[4]),
+                  anchor_message_id: String(params[5]),
+                  references_chain: String(params[6]),
+                  reply_subject: params[7] === null ? null : String(params[7]),
+                  created_at: String(params[8]),
+                  updated_at: String(params[9]),
+                })
+                return Promise.reject(new Error(
+                  'D1_ERROR: UNIQUE constraint failed: direct_external_email_threads.owner_mailbox, direct_external_email_threads.peer_email, direct_external_email_threads.topic_key: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)',
+                ))
+              }
               directExternalEmailThreads.push({
                 id: String(params[0]),
                 owner_mailbox: String(params[1]),
@@ -2401,6 +2631,76 @@ describe('worker: inbound direct external thread tracking', () => {
       anchor_message_id: '<external-new-compose@example.com>',
       references_chain: '<external-new-compose@example.com>',
       reply_subject: 'A different note',
+    })
+  })
+
+  test('inbound external reply without ancestry headers reuses the matching topic key thread', async () => {
+    const directExternalEmailThreads: DirectExternalEmailThreadRow[] = [{
+      id: 'thread-chat-1',
+      owner_mailbox: 'recipient@example.com',
+      peer_email: 'sender@example.com',
+      topic_key: 'chat',
+      topic_label: 'Chat',
+      anchor_message_id: '<chat-anchor@canyin.uk>',
+      references_chain: '<chat-root@canyin.uk>',
+      reply_subject: 'Chat',
+      created_at: '2026-05-15T00:00:00.000Z',
+      updated_at: '2026-05-15T00:00:00.000Z',
+    }]
+    const env = {
+      DB: createDirectExternalThreadTrackingMockD1(directExternalEmailThreads),
+      MAILBOX: 'worker@canyin.uk',
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Re: Chat',
+      bodyText: 'Reply missing References and In-Reply-To',
+      messageId: '<chat-reply-no-ancestry@example.com>',
+    })
+
+    await worker.email(message, env)
+
+    expect(directExternalEmailThreads).toHaveLength(1)
+    expect(directExternalEmailThreads[0]).toMatchObject({
+      id: 'thread-chat-1',
+      topic_key: 'chat',
+      topic_label: encodeStoredDirectExternalTopicLabel('Chat'),
+      anchor_message_id: '<chat-reply-no-ancestry@example.com>',
+      references_chain: '<chat-root@canyin.uk> <chat-anchor@canyin.uk> <chat-reply-no-ancestry@example.com>',
+      reply_subject: 'Re: Chat',
+    })
+  })
+
+  test('inbound external new thread survives direct_external_email_threads unique insert races', async () => {
+    const directExternalEmailThreads: DirectExternalEmailThreadRow[] = []
+    const env = {
+      DB: createDirectExternalThreadTrackingMockD1(directExternalEmailThreads, {
+        conflictOnInsertOnce: true,
+      }),
+      MAILBOX: 'worker@canyin.uk',
+    } as Env
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@example.com',
+      subject: 'Chat',
+      bodyText: 'Initial external message racing another insert',
+      messageId: '<chat-race@example.com>',
+    })
+
+    await expect(worker.email(message, env)).resolves.toBeUndefined()
+
+    expect(directExternalEmailThreads).toHaveLength(1)
+    expect(directExternalEmailThreads[0]).toMatchObject({
+      id: 'thread-race-winner',
+      owner_mailbox: 'recipient@example.com',
+      peer_email: 'sender@example.com',
+      topic_key: 'chat',
+      anchor_message_id: '<chat-race@example.com>',
+      references_chain: '<chat-race@example.com>',
+      reply_subject: 'Chat',
     })
   })
 
@@ -3519,6 +3819,90 @@ describe('worker: GET /api/sync', () => {
     expect(json.conversations[0]?.peer).toBe('friend@example.com')
     expect(json.conversations[0]?.email.id).toBe('conv-e1')
     expect(json.conversations[0]?.email.to_address).toBe('user@test.com')
+    const conversationQuery = capturedSqls.find((sql) => sql.includes('latest_per_peer AS'))
+    expect(conversationQuery).toBeTruthy()
+    expect(conversationQuery!).toContain('e.to_address')
+    const conversationBind = capturedBinds.find((entry) => entry.sql.includes('latest_per_peer AS'))
+    expect(conversationBind).toBeTruthy()
+    expect(conversationBind!.args.at(-1)).toBe(21)
+  })
+
+  test('internal conversations allow matching secondary-domain direct-user mailboxes', async () => {
+    const capturedSqls: string[] = []
+    const capturedBinds: Array<{ sql: string; args: unknown[] }> = []
+    const mailbox = 'user@yepage.net'
+    const db = {
+      prepare: mock((sql: string) => {
+        capturedSqls.push(sql)
+        return {
+          bind: mock((...args: unknown[]) => {
+            capturedBinds.push({ sql, args })
+            if (sql.includes('FROM users u') && sql.includes('LEFT JOIN chat_groups g')) {
+              return {
+                first: mock(() => Promise.resolve({ id: 'user-yepage-1' })),
+                all: mock(() => Promise.resolve({ results: [] })),
+                run: mock(() => Promise.resolve({ success: true })),
+              }
+            }
+            return {
+              first: mock(() => Promise.resolve(null)),
+              all: mock(() => Promise.resolve({
+                results: [{
+                  peer_address: 'friend@example.com',
+                  id: 'conv-yepage-1',
+                  to_address: mailbox,
+                  direction: 'inbound',
+                  status: 'received',
+                  body_text: 'Hello yepage mailbox',
+                  body_html: '<p>Hello yepage mailbox</p>',
+                  received_at: '2026-03-19T10:00:00Z',
+                }],
+              })),
+              run: mock(() => Promise.resolve({ success: true })),
+            }
+          }),
+        }
+      }),
+    } as unknown as D1Database
+
+    const env = {
+      DB: db,
+      INTERNAL_API_TOKEN: 'internal-token',
+      ACCESS_TOKEN_SECRET: 'test-auth-secret',
+    } as Env
+    const accessToken = createAccessToken({
+      sub: 'user-yepage-1',
+      email: 'user@example.com',
+      mailbox,
+    })
+    const response = await worker.fetch(
+      new Request(`http://localhost/internal/conversations?to=${encodeURIComponent(mailbox)}&limit=20`, {
+        headers: {
+          Authorization: 'Bearer internal-token',
+          'X-Mailbox': mailbox,
+          'X-User-Authorization': `Bearer ${accessToken}`,
+        },
+      }),
+      env,
+    )
+    const json = await response.json() as {
+      conversations: Array<{
+        peer: string
+        email: {
+          id: string
+          to_address: string
+          direction: string
+        }
+      }>
+      next_cursor: string | null
+    }
+
+    expect(response.status).toBe(200)
+    expect(json.conversations).toHaveLength(1)
+    expect(json.next_cursor).toBeNull()
+    expect(json.conversations[0]?.peer).toBe('friend@example.com')
+    expect(json.conversations[0]?.email.id).toBe('conv-yepage-1')
+    expect(json.conversations[0]?.email.to_address).toBe(mailbox)
     const conversationQuery = capturedSqls.find((sql) => sql.includes('latest_per_peer AS'))
     expect(conversationQuery).toBeTruthy()
     expect(conversationQuery!).toContain('e.to_address')

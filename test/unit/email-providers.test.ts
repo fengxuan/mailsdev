@@ -189,7 +189,7 @@ describe('ZeptoMailProvider', () => {
     }])
   })
 
-  test('rewrites ZeptoMail from/reply_to when provider-specific sender is configured', async () => {
+  test('preserves explicit ZeptoMail from when provider-default sender is not requested', async () => {
     const fetchMock = mock(() =>
       Promise.resolve(Response.json({ request_id: 'zepto-fixed-from' }, { status: 200 })),
     )
@@ -201,6 +201,29 @@ describe('ZeptoMailProvider', () => {
 
     const res = await sendWithChain([provider!], baseReq({
       from: 'Agent <me@canyin.uk>',
+    }))
+
+    expect(res).toEqual({ id: 'zepto-fixed-from', provider: 'zeptomail' })
+
+    const [, init] = (fetchMock as any).mock.calls[0]
+    const body = JSON.parse((init as RequestInit).body as string)
+    expect(body.from).toEqual({ address: 'me@canyin.uk', name: 'Agent' })
+    expect(body.reply_to).toBeUndefined()
+  })
+
+  test('rewrites ZeptoMail from/reply_to when provider-default sender is requested', async () => {
+    const fetchMock = mock(() =>
+      Promise.resolve(Response.json({ request_id: 'zepto-fixed-from' }, { status: 200 })),
+    )
+    const [provider] = buildProviderChain({
+      ZEPTOMAIL_API_KEY: 'zk',
+      ZEPTOMAIL_FROM_EMAIL: 'chat@yepage.net',
+      EMAIL_PROVIDERS: 'zeptomail',
+    }, fetchMock as unknown as typeof fetch)
+
+    const res = await sendWithChain([provider!], baseReq({
+      from: 'Agent <me@canyin.uk>',
+      use_provider_default_sender: true,
     }))
 
     expect(res).toEqual({ id: 'zepto-fixed-from', provider: 'zeptomail' })
