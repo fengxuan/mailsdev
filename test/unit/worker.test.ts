@@ -1922,7 +1922,7 @@ describe('worker: inbound email realtime notify', () => {
     })
     const env = {
       DB: db,
-      INTERNAL_MAILBOX_DOMAINS: 'canyin.uk,yepage.net',
+      INTERNAL_MAILBOX_DOMAINS: 'canyin.uk,yepage.net,bemail.nz',
       REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
       REALTIME_INTERNAL_TOKEN: 'rt-internal',
     } as Env
@@ -1983,6 +1983,75 @@ describe('worker: inbound email realtime notify', () => {
     })
   })
 
+  test('direct inbound email on a third mailbox domain emits realtime conversation update', async () => {
+    const { db } = createRealtimeRoutingMockD1({
+      directUsersByMailbox: {
+        'recipient@bemail.nz': 'user-recipient-bemail',
+      },
+    })
+    const env = {
+      DB: db,
+      INTERNAL_MAILBOX_DOMAINS: 'canyin.uk,yepage.net,bemail.nz',
+      REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
+      REALTIME_INTERNAL_TOKEN: 'rt-internal',
+    } as Env
+    const realtimeNotifyBodies: Array<Record<string, any>> = []
+    globalThis.fetch = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url === 'https://realtime.example.com/internal/notify') {
+        realtimeNotifyBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      if (url === 'https://realtime.example.com/internal/notify-batch') {
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        realtimeNotifyBodies.push(...(body.events ?? []))
+        return new Response(JSON.stringify({ ok: true, count: (body.events ?? []).length }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch url ${url}`)
+    }) as typeof fetch
+
+    const message = makeForwardableEmailMessage({
+      from: 'sender@example.com',
+      to: 'recipient@bemail.nz',
+      subject: 'Hi bemail',
+      bodyText: 'Hello bemail',
+    })
+    const harness = createExecutionContextHarness()
+    await worker.email(message, env, harness.ctx)
+    await harness.flush()
+
+    expect(realtimeNotifyBodies).toHaveLength(1)
+    expect(realtimeNotifyBodies[0]!.target.user_id).toBe('user-recipient-bemail')
+    expect(realtimeNotifyBodies[0]!.type).toBe('conversation_updated')
+    expect(realtimeNotifyBodies[0]!.data).toMatchObject({
+      peer: 'sender@example.com',
+      conversation_type: 'direct',
+      group_mailbox: null,
+      sync_mode: 'mail',
+      conversation: {
+        peer: 'sender@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        last_message: 'Hello bemail',
+        last_direction: 'inbound',
+        last_sender_email: 'sender@example.com',
+        last_sender_name: null,
+      },
+      message: {
+        peer: 'sender@example.com',
+        conversation_type: 'direct',
+        group_mailbox: null,
+        sync_mode: 'mail',
+        direction: 'inbound',
+        text: 'Hello bemail',
+        status: 'received',
+        sender_email: 'sender@example.com',
+        sender_name: null,
+      },
+    })
+  })
+
   test('email routing original-recipient headers route secondary-domain inbox mail to the user mailbox', async () => {
     const { db } = createRealtimeRoutingMockD1({
       directUsersByMailbox: {
@@ -1992,7 +2061,7 @@ describe('worker: inbound email realtime notify', () => {
     const env = {
       DB: db,
       MAILBOX: 'chat@canyin.uk',
-      INTERNAL_MAILBOX_DOMAINS: 'canyin.uk,yepage.net',
+      INTERNAL_MAILBOX_DOMAINS: 'canyin.uk,yepage.net,bemail.nz',
       REALTIME_NOTIFY_BASE_URL: 'https://realtime.example.com',
       REALTIME_INTERNAL_TOKEN: 'rt-internal',
     } as Env
@@ -2867,7 +2936,7 @@ describe('worker: inbound direct external thread tracking', () => {
     const env = {
       DB: createDirectExternalThreadTrackingMockD1(directExternalEmailThreads),
       MAILBOX: 'worker@canyin.uk',
-      INTERNAL_MAILBOX_DOMAINS: 'canyin.uk,yepage.net',
+      INTERNAL_MAILBOX_DOMAINS: 'canyin.uk,yepage.net,bemail.nz',
     } as Env
 
     const message = makeForwardableEmailMessage({
